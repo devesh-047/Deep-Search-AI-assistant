@@ -1,0 +1,3 @@
+# This directory holds all processed artifacts (normalised docs, embeddings,
+# FAISS indices).  Raw data is never modified; every pipeline stage writes
+# its output here.

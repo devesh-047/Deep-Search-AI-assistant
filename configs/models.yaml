@@ -1,0 +1,72 @@
+# ============================================================================
+# Deep Search AI Assistant -- Model Registry
+# ============================================================================
+# Central catalogue of every model used in the project.  Each entry records
+# the model's purpose, source, expected footprint, and the runtime that will
+# execute it.  This file is documentation *and* configuration: the pipeline
+# reads it at startup to resolve model paths.
+# ============================================================================
+
+models:
+  # -- Embedding model -------------------------------------------------------
+  embedding:
+    name: "all-MiniLM-L6-v2"
+    source: "sentence-transformers/all-MiniLM-L6-v2"
+    purpose: >
+      Encode text chunks into 384-dimensional dense vectors for semantic
+      similarity search.  Small enough to run on CPU with negligible latency;
+      converts cleanly to OpenVINO IR for further acceleration.
+    dimension: 384
+    max_sequence_length: 256
+    runtime: "sentence-transformers"   # current
+    future_runtime: "openvino"         # target after Phase 9
+    size_mb: 80
+    licence: "Apache-2.0"
+
+  # -- LLM (answer generation) -----------------------------------------------
+  llm:
+    name: "Mistral-7B-Instruct"
+    source: "ollama pull mistral"
+    purpose: >
+      Generate natural-language answers grounded in retrieved context.  Served
+      locally by Ollama -- no cloud dependency.  The model is used strictly
+      for *generation*; retrieval is embedding-based and does not touch the LLM.
+    parameters: "7B"
+    quantisation: "Q4_0 (Ollama default)"
+    runtime: "ollama"
+    future_runtime: "openvino-genai"
+    vram_mb: 4200
+    licence: "Apache-2.0"
+
+  # -- OCR (baseline) -------------------------------------------------------
+  ocr_tesseract:
+    name: "Tesseract OCR"
+    source: "system package (apt install tesseract-ocr)"
+    purpose: >
+      Extract text from scanned document images.  Used as the baseline OCR
+      engine.  No GPU required.
+    runtime: "pytesseract"
+    future_runtime: "paddleocr + openvino"
+
+  # -- OCR (future upgrade) --------------------------------------------------
+  ocr_paddle:
+    name: "PaddleOCR"
+    source: "paddleocr Python package"
+    purpose: >
+      Higher-accuracy OCR with layout analysis.  PaddlePaddle inference models
+      can be converted to OpenVINO IR for hardware-accelerated execution on
+      Intel iGPU or NPU.
+    runtime: "placeholder"
+    status: "not yet implemented"
+
+  # -- Multimodal alignment (future) -----------------------------------------
+  clip:
+    name: "CLIP ViT-B/32"
+    source: "openai/clip-vit-base-patch32"
+    purpose: >
+      Align text and image embeddings into a shared vector space so that a
+      text query can retrieve relevant images (and vice versa).  This is a
+      placeholder for the multimodal extension of the search pipeline.
+    dimension: 512
+    runtime: "placeholder"
+    status: "not yet implemented"

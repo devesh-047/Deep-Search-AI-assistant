@@ -1,0 +1,94 @@
+# ============================================================================
+# Deep Search AI Assistant -- Global Settings
+# ============================================================================
+# This file is the single source of truth for every path, parameter, and
+# threshold used across the pipeline.  Modules should read from here rather
+# than hard-coding values so that experiments are reproducible and changes
+# propagate consistently.
+# ============================================================================
+
+# -- Paths -------------------------------------------------------------------
+paths:
+  # Raw datasets (READ-ONLY -- never write here).
+  raw_data_root: "/mnt/d/Openvino-project/data/raw"
+
+  # All pipeline outputs land under this directory.
+  processed_root: "data/processed"
+
+  # Sub-directories created automatically by each pipeline stage.
+  normalised_dir: "data/processed/normalised"
+  chunks_dir: "data/processed/chunks"
+  embeddings_dir: "data/processed/embeddings"
+  faiss_dir: "data/processed/faiss"
+  ocr_cache_dir: "data/processed/ocr_cache"
+
+  # Runtime logs.
+  log_dir: "logs"
+
+# -- Datasets ----------------------------------------------------------------
+# Each entry maps a short CLI name to its location under raw_data_root.
+# "format" is either "dataset_dict" (has splits/) or "dataset" (flat arrow).
+datasets:
+  funsd:
+    path: "funsd"
+    format: "dataset_dict"
+    splits: ["train", "test"]
+    description: "FUNSD form understanding -- words, bboxes, NER tags, images"
+
+  docvqa:
+    path: "docvqa"
+    format: "dataset"
+    description: "DocVQA subset -- question/answer pairs over document images"
+
+  rvl_cdip:
+    path: "rvl_cdip"
+    format: "dataset"
+    description: "RVL-CDIP subset -- 16-class document image classification"
+
+# -- OCR ---------------------------------------------------------------------
+ocr:
+  engine: "tesseract"            # "tesseract" or "paddleocr" (future)
+  tesseract_lang: "eng"
+  preprocess: true               # apply adaptive-threshold before OCR
+  confidence_threshold: 40       # discard words below this Tesseract confidence
+
+# -- Chunking ----------------------------------------------------------------
+chunking:
+  strategy: "fixed"              # "fixed" character-window; "sentence" planned
+  chunk_size: 512                # characters per chunk
+  chunk_overlap: 64              # overlap between consecutive chunks
+  min_chunk_length: 30           # discard chunks shorter than this
+
+# -- Embeddings --------------------------------------------------------------
+embeddings:
+  model_name: "sentence-transformers/all-MiniLM-L6-v2"
+  dimension: 384
+  batch_size: 64
+  device: "cpu"                  # "cpu" for stability; "cuda" if VRAM permits
+  normalise: true                # L2-normalise before indexing
+
+# -- FAISS -------------------------------------------------------------------
+faiss:
+  index_type: "IndexFlatIP"      # inner-product on L2-normed vectors = cosine
+  nprobe: 10                     # only relevant if you switch to IVF later
+
+# -- Retrieval ---------------------------------------------------------------
+retrieval:
+  top_k: 5                       # number of chunks returned per query
+  score_threshold: 0.0           # minimum similarity to include in results
+
+# -- LLM (Ollama) ------------------------------------------------------------
+llm:
+  provider: "ollama"             # "ollama" or "openvino" (future)
+  model: "mistral"               # pulled via `ollama pull mistral`
+  endpoint: "http://localhost:11434"
+  temperature: 0.3
+  max_tokens: 512
+  timeout_seconds: 120
+
+# -- OpenVINO (future) -------------------------------------------------------
+openvino:
+  enabled: false
+  device: "CPU"                  # "CPU", "GPU", "NPU"
+  embedding_model_ir: "models/ov/all-MiniLM-L6-v2/openvino_model.xml"
+  llm_model_ir: ""               # path to converted LLM IR (placeholder)
