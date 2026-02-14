@@ -152,3 +152,42 @@ class EmbeddingEncoder:
         arr = np.load(path)
         logger.info("Loaded embeddings from %s: shape %s", path, arr.shape)
         return arr
+
+
+# ---------------------------------------------------------------------------
+# Demo/Test: Run encoder and compute cosine similarity (TODO 1 & 2)
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    import numpy as np
+    import sys
+    print("[Encoder Demo] Running sample embedding and similarity test...")
+    try:
+        encoder = EmbeddingEncoder()
+    except ImportError as e:
+        print("ERROR:", e)
+        sys.exit(1)
+
+    # Sample texts: related and unrelated
+    texts = [
+        "The quick brown fox jumps over the lazy dog.",
+        "A fast brown fox leaps over a sleepy dog.",  # semantically similar
+        "Quantum mechanics describes the behavior of particles at atomic scales.",  # unrelated
+    ]
+    embeddings = encoder.encode(texts)
+    print(f"Embeddings shape: {embeddings.shape}")
+    for i, emb in enumerate(embeddings):
+        print(f"  Text {i}: {emb.shape}, norm={np.linalg.norm(emb):.4f}")
+
+    # Cosine similarity matrix
+    def cosine_sim(a, b):
+        return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+
+    print("\nCosine similarity matrix:")
+    for i in range(len(texts)):
+        row = []
+        for j in range(len(texts)):
+            sim = cosine_sim(embeddings[i], embeddings[j])
+            row.append(f"{sim:.3f}")
+        print(f"  {i}: {row}")
+
+    print("\n[Done]")

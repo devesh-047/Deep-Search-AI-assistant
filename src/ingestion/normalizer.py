@@ -20,19 +20,23 @@ Why normalise?
     flattens everything into a single representation so that downstream
     stages (chunker, embedder, indexer) need zero dataset-specific logic.
 
-Learning TODO
--------------
-1. Add deduplication (skip documents whose doc_id already exists in
-   the processed directory).
-2. Add language detection (langdetect or fasttext) and store in metadata.
-3. Strip boilerplate headers/footers common in corporate documents.
+Features
+--------
+* **Deduplication** -- documents whose ``doc_id`` already exists in a
+  previously saved JSONL file are skipped during normalisation.
+* **Language detection** -- when ``langdetect`` is installed, the detected
+  language code (e.g. ``en``, ``de``) is stored in ``metadata["language"]``.
+* **Boilerplate stripping** -- common corporate headers/footers
+  (page numbers, confidentiality notices, "Page X of Y", etc.) are
+  removed before the text is stored.
 """
 
 import hashlib
 import json
 import logging
+import re
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional, Set
 
 from src.ingestion.loader import RawDocument
 
@@ -45,6 +49,75 @@ def _make_doc_id(key: str) -> str:
     Uses SHA-256 truncated to 12 hex characters for brevity.
     """
     return hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
+
+
+# ---------------------------------------------------------------------------
+# Language detection helper
+# ---------------------------------------------------------------------------
+
+def _detect_language(text: str) -> Optional[str]:
+    """
+    Detect the language of *text* using ``langdetect``.
+
+    Returns the ISO 639-1 code (e.g. ``"en"``, ``"de"``) or ``None`` if
+    detection fails or the library is not installed.  Short texts
+    (< 20 characters) are skipped because they produce unreliable results.
+    """
+    if not text or len(text.strip()) < 20:
+        return None
+    try:
+        from langdetect import detect, LangDetectException
+    except ImportError:
+        logger.debug(
+            "langdetect is not installed -- skipping language detection.  "
+            "Install it with:  pip install langdetect"
+        )
+        return None
+    try:
+        return detect(text)
+    except LangDetectException:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Boilerplate stripping helpers
+# ---------------------------------------------------------------------------
+
+# Compiled once at import time for performance.
+_BOILERPLATE_PATTERNS: List[re.Pattern] = [
+    # "Page X of Y" or "Page X"
+    re.compile(r"(?i)^\s*page\s+\d+(?:\s+of\s+\d+)?\s*$", re.MULTILINE),
+    # Bare page numbers on their own line
+    re.compile(r"^\s*-?\s*\d{1,4}\s*-?\s*$", re.MULTILINE),
+    # Confidentiality / disclaimer notices
+    re.compile(
+        r"(?i)^\s*(?:confidential|privileged|do not distribute|internal use only"
+        r"|proprietary|strictly private|not for public release).*$",
+        re.MULTILINE,
+    ),
+    # "DRAFT" watermarks
+    re.compile(r"(?i)^\s*-{0,3}\s*draft\s*-{0,3}\s*$", re.MULTILINE),
+    # Common email/fax header lines
+    re.compile(
+        r"(?i)^\s*(?:from:|to:|cc:|bcc:|sent:|date:|subject:|fax:)\s*$",
+        re.MULTILINE,
+    ),
+]
+
+
+def _strip_boilerplate(text: str) -> str:
+    """
+    Remove common corporate boilerplate lines from *text*.
+
+    Each pattern in ``_BOILERPLATE_PATTERNS`` is applied in order.  Matched
+    lines are replaced with empty strings, then runs of 3+ blank lines are
+    collapsed to 2.
+    """
+    for pattern in _BOILERPLATE_PATTERNS:
+        text = pattern.sub("", text)
+    # Collapse excessive blank lines left behind.
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
 class NormalizedDocument:
@@ -112,30 +185,110 @@ class DocumentNormalizer:
         normalizer.save(norm_docs)
     """
 
-    def __init__(self, output_dir: str = "data/processed/normalised"):
+    def __init__(self, output_dir: str = "data/processed/normalised",
+                 deduplicate: bool = True,
+                 detect_language: bool = True,
+                 strip_boilerplate: bool = True):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.deduplicate = deduplicate
+        self.detect_language = detect_language
+        self.strip_boilerplate = strip_boilerplate
 
-    def normalize(self, raw_docs: List[RawDocument]) -> List[NormalizedDocument]:
+    # ------------------------------------------------------------------ #
+    # Deduplication helpers                                                #
+    # ------------------------------------------------------------------ #
+
+    def _load_existing_ids(self, filename: str = "documents.jsonl") -> Set[str]:
+        """
+        Scan the previously-saved JSONL file and return all ``doc_id``
+        values found there.  Returns an empty set if the file does not
+        exist yet.
+        """
+        out_path = self.output_dir / filename
+        ids: Set[str] = set()
+        if not out_path.exists():
+            return ids
+        with open(out_path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    try:
+                        ids.add(json.loads(line)["doc_id"])
+                    except (json.JSONDecodeError, KeyError):
+                        continue
+        logger.info("Dedup: %d existing document IDs loaded from %s",
+                     len(ids), out_path)
+        return ids
+
+    # ------------------------------------------------------------------ #
+    # Core normalisation                                                  #
+    # ------------------------------------------------------------------ #
+
+    def normalize(self, raw_docs: List[RawDocument],
+                  jsonl_filename: str = "documents.jsonl"
+                  ) -> List[NormalizedDocument]:
         """
         Convert raw documents to the unified schema.
 
-        Documents with empty text are still included -- they will receive
-        text later via the OCR pipeline.
+        * If ``deduplicate`` is enabled, documents whose ``doc_id`` already
+          appears in the saved JSONL file are silently skipped.
+        * If ``strip_boilerplate`` is enabled, common corporate
+          headers/footers are removed from the text.
+        * If ``detect_language`` is enabled and ``langdetect`` is installed,
+          the detected language code is stored in
+          ``metadata["language"]``.
+        * Documents with empty text are still included -- they will receive
+          text later via the OCR pipeline.
         """
+        # --- Deduplication: collect already-processed IDs ----------------
+        existing_ids: Set[str] = set()
+        if self.deduplicate:
+            existing_ids = self._load_existing_ids(jsonl_filename)
+
+        try:
+            from tqdm import tqdm
+            iterator = tqdm(raw_docs, desc="Normalizing", unit="doc")
+        except ImportError:
+            iterator = raw_docs
+
         normalized: List[NormalizedDocument] = []
-        for raw in raw_docs:
+        skipped = 0
+        for raw in iterator:
             doc_id = _make_doc_id(raw.doc_key)
+
+            # Skip duplicates.
+            if doc_id in existing_ids:
+                skipped += 1
+                continue
+            # Also guard against duplicates *within* this batch.
+            existing_ids.add(doc_id)
+
+            # --- Text cleaning -------------------------------------------
+            text = raw.text.strip()
+            if text and self.strip_boilerplate:
+                text = _strip_boilerplate(text)
+
+            # --- Language detection --------------------------------------
+            metadata = dict(raw.metadata)  # shallow copy to avoid mutation
+            if self.detect_language:
+                lang = _detect_language(text)
+                # Fall back to "en" if detection is unavailable or fails.
+                metadata["language"] = lang or "en"
+
             doc_type = self._classify_type(raw)
             norm = NormalizedDocument(
                 doc_id=doc_id,
                 source=raw.source,
                 doc_type=doc_type,
-                text=raw.text.strip(),
+                text=text,
                 image_path=raw.image_path or "",
-                metadata=raw.metadata,
+                metadata=metadata,
             )
             normalized.append(norm)
+
+        if skipped:
+            logger.info("Dedup: skipped %d duplicate documents", skipped)
         logger.info("Normalised %d documents", len(normalized))
         return normalized
 

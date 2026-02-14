@@ -1243,11 +1243,11 @@ marks the current status.
 
 | Component | File | Status | What to Do |
 |-----------|------|--------|------------|
-| Device detection | `src/openvino/device_manager.py` | Working | Functional as-is |
-| Model conversion | `src/openvino/model_converter.py` | Partial | Test end-to-end with all-MiniLM-L6-v2 |
-| OV embedding encoder | `src/embeddings/openvino_encoder.py` | Placeholder | Implement tokenizer + inference + pooling |
-| OV LLM client | `src/llm/openvino_llm.py` | Placeholder | Implement via `openvino-genai.LLMPipeline` |
-| PaddleOCR + OV | `src/ocr/paddle_engine.py` | Placeholder | Install PaddleOCR, convert models to IR |
+| Device detection | `src/openvino/device_manager.py` | ✅ **Complete** | Phases 9-10: settings.yaml integration, AUTO/MULTI support, benchmarking |
+| Model conversion | `src/openvino/model_converter.py` | ✅ **Complete** | Phase 9: ONNX export, IR conversion, FP16 compression all tested |
+| OV embedding encoder | `src/embeddings/openvino_encoder.py` | ✅ **Complete** | Phase 9: Full inference pipeline with tokenization, pooling, normalization |
+| OV LLM client | `src/llm/openvino_llm.py` | ✅ **Complete** | Dual backend: openvino-genai + optimum-intel, RAG prompt, benchmarking |
+| PaddleOCR + OV | `src/ocr/paddle_engine.py` | ✅ **Complete** | Full OCR pipeline, OpenVINO ONNX backend, TesseractEngine-compatible API |
 
 ### Conversion commands reference
 

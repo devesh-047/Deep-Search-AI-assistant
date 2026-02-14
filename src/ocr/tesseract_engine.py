@@ -15,13 +15,10 @@ Design notes:
       are available via ``extract_with_boxes`` for layout-aware pipelines.
     - The engine operates on images already extracted to disk (by the
       DatasetLoader) and referenced via ``NormalizedDocument.image_path``.
-
-Learning TODO:
-    1. Run OCR on a FUNSD sample and compare output to the ground-truth
-       ``words`` column.
-    2. Tune the confidence threshold and measure the effect on text quality.
-    3. Try different Tesseract page-segmentation modes (--psm flag).
-    4. Test preprocessing on/off and measure word-error-rate differences.
+    - Supports Tesseract page-segmentation modes (PSM) for different
+      document layouts.
+    - Includes utilities for comparing OCR output with ground truth and
+      tuning confidence/preprocessing settings.
 """
 
 import logging
@@ -66,6 +63,7 @@ class TesseractEngine:
         lang: str = "eng",
         preprocess: bool = True,
         confidence_threshold: int = 40,
+        psm: int = 3,
     ):
         """
         Args:
@@ -73,6 +71,10 @@ class TesseractEngine:
             preprocess           : Apply adaptive-threshold preprocessing.
             confidence_threshold : Discard words with confidence below this
                                    value (0-100).
+            psm                  : Page segmentation mode (0-13). Common:
+                                   3 = Fully automatic (default)
+                                   6 = Uniform block of text
+                                   11 = Sparse text, find as much as possible
         """
         if not TESSERACT_AVAILABLE:
             raise ImportError(
@@ -85,6 +87,7 @@ class TesseractEngine:
         self.lang = lang
         self.preprocess = preprocess
         self.confidence_threshold = confidence_threshold
+        self.psm = psm
 
     # ------------------------------------------------------------------ #
     # Public API                                                          #
@@ -105,7 +108,8 @@ class TesseractEngine:
             img = self._preprocess(img)
 
         try:
-            text = pytesseract.image_to_string(img, lang=self.lang)
+            config = f"--psm {self.psm}"
+            text = pytesseract.image_to_string(img, lang=self.lang, config=config)
             return text.strip()
         except Exception as exc:
             logger.error("OCR failed for %s: %s", image_path, exc)
@@ -127,8 +131,9 @@ class TesseractEngine:
             img = self._preprocess(img)
 
         try:
+            config = f"--psm {self.psm}"
             data = pytesseract.image_to_data(
-                img, lang=self.lang, output_type=pytesseract.Output.DICT
+                img, lang=self.lang, config=config, output_type=pytesseract.Output.DICT
             )
         except Exception as exc:
             logger.error("OCR (boxes) failed for %s: %s", image_path, exc)
@@ -161,11 +166,125 @@ class TesseractEngine:
 
         Returns a list of (image_path, extracted_text) tuples.
         """
+        try:
+            from tqdm import tqdm
+            iterator = tqdm(image_paths, desc="OCR", unit="img")
+        except ImportError:
+            iterator = image_paths
+            
         results: List[Tuple[str, str]] = []
-        for path in image_paths:
+        for path in iterator:
             text = self.extract_text(path)
             results.append((path, text))
         logger.info("Batch OCR: processed %d images", len(results))
+        return results
+
+    def compare_with_ground_truth(
+        self, image_path: str, ground_truth_words: List[str]
+    ) -> Dict:
+        """
+        Compare OCR output against ground-truth words.
+
+        Useful for evaluating OCR accuracy on datasets like FUNSD that
+        include ground-truth word annotations.
+
+        Args:
+            image_path         : Path to the image.
+            ground_truth_words : List of expected words (e.g. from FUNSD).
+
+        Returns:
+            dict with keys:
+                - ocr_text       : The extracted text string.
+                - ocr_words      : List of OCR words.
+                - ground_truth   : List of ground-truth words.
+                - word_accuracy  : % of ground-truth words found in OCR.
+                - precision      : % of OCR words that match ground truth.
+                - recall         : % of ground-truth words found in OCR.
+        """
+        ocr_text = self.extract_text(image_path)
+        ocr_words = [w.lower() for w in ocr_text.split() if w.strip()]
+        gt_words = [w.lower() for w in ground_truth_words if w.strip()]
+
+        # Calculate word-level metrics
+        gt_set = set(gt_words)
+        ocr_set = set(ocr_words)
+
+        matches = gt_set & ocr_set
+        precision = len(matches) / len(ocr_set) if ocr_set else 0.0
+        recall = len(matches) / len(gt_set) if gt_set else 0.0
+
+        return {
+            "ocr_text": ocr_text,
+            "ocr_words": ocr_words,
+            "ground_truth": gt_words,
+            "word_accuracy": recall * 100,  # % of GT words found
+            "precision": precision * 100,
+            "recall": recall * 100,
+            "ocr_word_count": len(ocr_words),
+            "gt_word_count": len(gt_words),
+        }
+
+    def tune_settings(
+        self,
+        image_path: str,
+        ground_truth_words: List[str],
+        test_configs: Optional[List[Dict]] = None,
+    ) -> List[Dict]:
+        """
+        Test multiple OCR configurations and rank by accuracy.
+
+        Useful for finding optimal settings for a specific document type.
+
+        Args:
+            image_path         : Path to a representative image.
+            ground_truth_words : Expected words for accuracy measurement.
+            test_configs       : List of config dicts with keys:
+                                 'preprocess', 'confidence_threshold', 'psm'.
+                                 If None, uses a sensible default grid.
+
+        Returns:
+            List of result dicts sorted by recall (best first), each with:
+                - config         : The tested configuration.
+                - word_accuracy  : % of ground-truth words found.
+                - ocr_word_count : Number of words extracted.
+        """
+        if test_configs is None:
+            # Default test grid
+            test_configs = [
+                {"preprocess": False, "confidence_threshold": 40, "psm": 3},
+                {"preprocess": True, "confidence_threshold": 40, "psm": 3},
+                {"preprocess": True, "confidence_threshold": 30, "psm": 3},
+                {"preprocess": True, "confidence_threshold": 50, "psm": 3},
+                {"preprocess": True, "confidence_threshold": 40, "psm": 6},
+                {"preprocess": True, "confidence_threshold": 40, "psm": 11},
+            ]
+
+        results: List[Dict] = []
+        for cfg in test_configs:
+            # Create a temporary engine with this config
+            engine = TesseractEngine(
+                lang=self.lang,
+                preprocess=cfg.get("preprocess", True),
+                confidence_threshold=cfg.get("confidence_threshold", 40),
+                psm=cfg.get("psm", 3),
+            )
+            comparison = engine.compare_with_ground_truth(
+                image_path, ground_truth_words
+            )
+            results.append({
+                "config": cfg,
+                "word_accuracy": comparison["word_accuracy"],
+                "precision": comparison["precision"],
+                "recall": comparison["recall"],
+                "ocr_word_count": comparison["ocr_word_count"],
+            })
+
+        # Sort by recall (descending)
+        results.sort(key=lambda r: r["recall"], reverse=True)
+        logger.info(
+            "Tuned %d configs for %s. Best recall: %.1f%%",
+            len(results), image_path, results[0]["recall"],
+        )
         return results
 
     # ------------------------------------------------------------------ #

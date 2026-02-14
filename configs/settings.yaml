@@ -47,10 +47,12 @@ datasets:
 
 # -- OCR ---------------------------------------------------------------------
 ocr:
-  engine: "tesseract"            # "tesseract" or "paddleocr" (future)
+  engine: "tesseract"            # "tesseract" or "paddleocr"
   tesseract_lang: "eng"
-  preprocess: true               # apply adaptive-threshold before OCR
-  confidence_threshold: 40       # discard words below this Tesseract confidence
+  paddleocr_lang: "en"           # PaddleOCR language ("en", "ch", etc.)
+  paddleocr_use_openvino: false  # Use OpenVINO backend for PaddleOCR
+  preprocess: true               # apply adaptive-threshold before OCR (Tesseract only)
+  confidence_threshold: 40       # discard words below this confidence (0-100)
 
 # -- Chunking ----------------------------------------------------------------
 chunking:
@@ -79,16 +81,20 @@ retrieval:
 
 # -- LLM (Ollama) ------------------------------------------------------------
 llm:
-  provider: "ollama"             # "ollama" or "openvino" (future)
-  model: "mistral"               # pulled via `ollama pull mistral`
+  provider: "openvino"           # "ollama" or "openvino"
+  model: "mistral"               # Ollama: model name; OpenVINO: ignored (uses openvino.llm_model_dir)
   endpoint: "http://localhost:11434"
   temperature: 0.3
   max_tokens: 512
   timeout_seconds: 120
 
-# -- OpenVINO (future) -------------------------------------------------------
+# -- OpenVINO ----------------------------------------------------------------
+# Set enabled: true to use OpenVINO for embedding inference instead of
+# PyTorch/sentence-transformers.  The pipeline reads these settings via
+# DeviceManager.select_from_settings().
 openvino:
-  enabled: false
-  device: "CPU"                  # "CPU", "GPU", "NPU"
-  embedding_model_ir: "models/ov/all-MiniLM-L6-v2/openvino_model.xml"
-  llm_model_ir: ""               # path to converted LLM IR (placeholder)
+  enabled: true                  # true = use OV encoder, false = use PyTorch
+  device: "CPU"                  # "CPU", "GPU", "NPU", "AUTO", "MULTI:CPU,GPU"
+  embedding_model_ir: "models/ov/all-MiniLM-L6-v2/model.xml"
+  llm_model_dir: "models/ov/mistral-7b-instruct"  # path to converted LLM directory
+

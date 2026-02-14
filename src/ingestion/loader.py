@@ -12,8 +12,7 @@ Two loading paths are supported:
    loader uses ``datasets.load_from_disk()`` to reload them.
 
 2. **Loose files** (secondary) -- plain text, PDF, DOCX, PPTX, and images
-   found by walking a directory tree.  Only ``.txt`` loading is implemented;
-   the rest are stubs for future work.
+   found by walking a directory tree.
 
 Design notes
 ------------
@@ -22,13 +21,11 @@ Design notes
   OCR cache so that Tesseract can process them.
 * Text columns (e.g. FUNSD ``words``) are joined into plain text here so
   that downstream stages see a single string per record.
-
-Learning TODO
--------------
-1. Implement PDF text extraction with PyPDF2 or pdfplumber.
-2. Implement DOCX paragraph extraction with python-docx.
-3. Implement PPTX slide text extraction with python-pptx.
-4. Handle DatasetDict splits more flexibly (e.g. only load ``train``).
+* PDF extraction uses **pdfplumber** for reliable text and layout handling.
+* DOCX extraction uses **python-docx** to iterate over paragraphs.
+* PPTX extraction uses **python-pptx** to iterate over slide text frames.
+* ``load_dataset`` accepts an optional ``splits`` parameter so callers can
+  restrict loading to specific splits (e.g. only ``train``).
 """
 
 import logging
@@ -133,6 +130,142 @@ def _extract_image(image_obj, save_path: str) -> str:
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     image_obj.save(save_path, format="PNG")
     return os.path.abspath(save_path)
+
+
+# ---------------------------------------------------------------------------
+# Loose-file text extraction helpers
+# ---------------------------------------------------------------------------
+
+def _extract_text_from_pdf(file_path: str) -> str:
+    """
+    Extract text from a PDF file using **pdfplumber**.
+
+    Iterates over every page in the PDF and concatenates the extracted text
+    with double newlines between pages.  Falls back to an empty string for
+    pages that yield no text (e.g. scanned images -- those should be routed
+    through the OCR module instead).
+
+    Parameters
+    ----------
+    file_path : str
+        Absolute or relative path to the ``.pdf`` file.
+
+    Returns
+    -------
+    str
+        The concatenated plain-text content of all pages.
+
+    Raises
+    ------
+    ImportError
+        If ``pdfplumber`` is not installed.
+    """
+    try:
+        import pdfplumber
+    except ImportError:
+        raise ImportError(
+            "The 'pdfplumber' library is required to extract text from PDFs.  "
+            "Install it with:  pip install pdfplumber"
+        )
+
+    pages_text: List[str] = []
+    with pdfplumber.open(file_path) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text()
+            if text:
+                pages_text.append(text)
+    return "\n\n".join(pages_text)
+
+
+def _extract_text_from_docx(file_path: str) -> str:
+    """
+    Extract text from a DOCX file using **python-docx**.
+
+    Iterates over every paragraph in the document and joins them with
+    newlines.
+
+    Parameters
+    ----------
+    file_path : str
+        Absolute or relative path to the ``.docx`` file.
+
+    Returns
+    -------
+    str
+        The concatenated plain-text content of all paragraphs.
+
+    Raises
+    ------
+    ImportError
+        If ``python-docx`` is not installed.
+    """
+    try:
+        import docx
+    except ImportError:
+        raise ImportError(
+            "The 'python-docx' library is required to extract text from DOCX files.  "
+            "Install it with:  pip install python-docx"
+        )
+
+    doc = docx.Document(file_path)
+    return "\n".join(paragraph.text for paragraph in doc.paragraphs if paragraph.text)
+
+
+def _extract_text_from_pptx(file_path: str) -> str:
+    """
+    Extract text from a PPTX file using **python-pptx**.
+
+    Iterates over every slide, then every shape with a text frame, and
+    concatenates all paragraph text.  Slides are separated by double
+    newlines.
+
+    Parameters
+    ----------
+    file_path : str
+        Absolute or relative path to the ``.pptx`` file.
+
+    Returns
+    -------
+    str
+        The concatenated plain-text content of all slides.
+
+    Raises
+    ------
+    ImportError
+        If ``python-pptx`` is not installed.
+    """
+    try:
+        from pptx import Presentation
+    except ImportError:
+        raise ImportError(
+            "The 'python-pptx' library is required to extract text from PPTX files.  "
+            "Install it with:  pip install python-pptx"
+        )
+
+    prs = Presentation(file_path)
+    slides_text: List[str] = []
+    for slide in prs.slides:
+        parts: List[str] = []
+        for shape in slide.shapes:
+            if shape.has_text_frame:
+                for paragraph in shape.text_frame.paragraphs:
+                    if paragraph.text.strip():
+                        parts.append(paragraph.text)
+        if parts:
+            slides_text.append("\n".join(parts))
+    return "\n\n".join(slides_text)
+
+
+# Map file extensions to their extraction functions.
+_FILE_EXTRACTORS = {
+    ".txt": lambda path: Path(path).read_text(encoding="utf-8", errors="replace"),
+    ".pdf": _extract_text_from_pdf,
+    ".docx": _extract_text_from_docx,
+    ".pptx": _extract_text_from_pptx,
+}
+
+# Image extensions that should be routed to the OCR module.
+_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp"}
 
 
 # ---------------------------------------------------------------------------
@@ -314,7 +447,8 @@ class DatasetLoader:
     # Public API                                                          #
     # ------------------------------------------------------------------ #
 
-    def load_dataset(self, name: str, max_records: int = 0) -> List[RawDocument]:
+    def load_dataset(self, name: str, max_records: int = 0,
+                     splits: Optional[List[str]] = None) -> List[RawDocument]:
         """
         Load a named dataset and return RawDocument objects.
 
@@ -325,6 +459,9 @@ class DatasetLoader:
             ``rvl_cdip``).
         max_records : int
             If > 0, load at most this many records (useful for quick tests).
+        splits : list of str or None
+            If provided, only load the specified splits (e.g.
+            ``["train"]``).  Ignored for datasets without splits.
 
         Returns
         -------
@@ -348,7 +485,73 @@ class DatasetLoader:
             )
             return []
 
-        return self._iterate_dataset(ds, name, handler, max_records)
+        return self._iterate_dataset(ds, name, handler, max_records, splits)
+
+    def load_directory(self, dir_path: str,
+                       max_records: int = 0) -> List[RawDocument]:
+        """
+        Walk a directory tree and load loose files (txt, pdf, docx, pptx,
+        images) into ``RawDocument`` objects.
+
+        Text is extracted inline for supported document types.  Image files
+        are recorded with an ``image_path`` so the OCR module can process
+        them later.
+
+        Parameters
+        ----------
+        dir_path : str
+            Path to the directory to walk.
+        max_records : int
+            If > 0, load at most this many files.
+
+        Returns
+        -------
+        list of RawDocument
+        """
+        root = Path(dir_path)
+        if not root.exists():
+            raise FileNotFoundError(f"Directory not found: {root}")
+
+        documents: List[RawDocument] = []
+        for file_path in sorted(root.rglob("*")):
+            if not file_path.is_file():
+                continue
+            if max_records > 0 and len(documents) >= max_records:
+                break
+
+            ext = file_path.suffix.lower()
+            rel = str(file_path.relative_to(root))
+
+            # Supported text-bearing document formats.
+            if ext in _FILE_EXTRACTORS:
+                try:
+                    text = _FILE_EXTRACTORS[ext](str(file_path))
+                except Exception as exc:
+                    logger.warning("Failed to extract text from %s: %s",
+                                   file_path, exc)
+                    text = ""
+                documents.append(RawDocument(
+                    doc_key=rel,
+                    source=str(file_path),
+                    text=text,
+                    metadata={"file_type": ext},
+                ))
+
+            # Image files -- defer to OCR.
+            elif ext in _IMAGE_EXTENSIONS:
+                documents.append(RawDocument(
+                    doc_key=rel,
+                    source=str(file_path),
+                    text="",
+                    image_path=str(file_path.resolve()),
+                    metadata={"file_type": ext},
+                ))
+            else:
+                logger.debug("Skipping unsupported file: %s", file_path)
+
+        logger.info("Directory '%s': %d documents loaded", dir_path,
+                     len(documents))
+        return documents
 
     def list_available_datasets(self) -> List[str]:
         """Return names of subdirectories under raw_data_root."""
@@ -364,11 +567,19 @@ class DatasetLoader:
     # Internal helpers                                                    #
     # ------------------------------------------------------------------ #
 
-    def _iterate_dataset(self, ds, name: str, handler, max_records: int
+    def _iterate_dataset(self, ds, name: str, handler, max_records: int,
+                         splits: Optional[List[str]] = None
                          ) -> List[RawDocument]:
         """
         Walk the loaded dataset (or DatasetDict) and apply the handler
         to each record.
+
+        Parameters
+        ----------
+        splits : list of str or None
+            If provided and the dataset is a ``DatasetDict``, only iterate
+            over the named splits.  Unknown split names are logged as
+            warnings and skipped.
         """
         from datasets import DatasetDict
 
@@ -376,8 +587,25 @@ class DatasetLoader:
         image_dir = str(self.image_cache_dir)
 
         if isinstance(ds, DatasetDict):
+            # Determine which splits to process.
+            available_splits = list(ds.keys())
+            if splits is not None:
+                selected = []
+                for s in splits:
+                    if s in ds:
+                        selected.append(s)
+                    else:
+                        logger.warning(
+                            "Requested split '%s' not found in dataset '%s'. "
+                            "Available splits: %s", s, name, available_splits,
+                        )
+                target_splits = selected
+            else:
+                target_splits = available_splits
+
             # E.g. FUNSD has train / test splits.
-            for split_name, split_ds in ds.items():
+            for split_name in target_splits:
+                split_ds = ds[split_name]
                 count = 0
                 for idx, record in enumerate(split_ds):
                     if max_records > 0 and len(documents) >= max_records:
