@@ -175,7 +175,7 @@ Device selection (`CPU`, `GPU`, `NPU`) is configurable in `settings.yaml`.
 **Use of AI Assistance**:
 AI tools were used during the development of this project for the following specific tasks:
 
-1.  **Code Structure**: Generating boilerplate command-line interface (CLI) logic.
+1.  **Code Structure**: Generating boilerplate command-line interface (CLI) logic and forming the repository structure.
 2.  **Documentation**: Assisting in structuring and formatting this README file.
 3.  **Debugging**: Analyzing stack traces to identify missing dependencies.
 4.  **Dataset Selection**: Suggesting appropriate public datasets (MSR-VTT) for multimodal testing.
