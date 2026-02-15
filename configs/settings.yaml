@@ -98,3 +98,39 @@ openvino:
   embedding_model_ir: "models/ov/all-MiniLM-L6-v2/model.xml"
   llm_model_dir: "models/ov/mistral-7b-instruct"  # path to converted LLM directory
 
+# -- Video Ingestion -------------------------------------------------------
+# Settings for the video extraction and interpretation pipeline.
+# These are used by `python cli.py ingest-videos`.
+video:
+  # Dataset name: "msrvtt" or "custom".  Controls how files are discovered.
+  dataset_name: "msrvtt"
+
+  # Path to raw video dataset root (overridable via CLI --video-root).
+  # MSR-VTT layout:  <root>/annotation/MSR_VTT.json  +  <root>/videos/all/*.mp4
+  video_data_root: "/mnt/d/Openvino-project/data/raw/archive/data/MSRVTT/MSRVTT"
+
+  # Enable Whisper transcription.  Set to false for caption-based datasets
+  # like MSR-VTT where captions are already provided in the annotation JSON.
+  enable_whisper: false
+
+  # Extract 1 frame every N seconds (for frame sampling + OCR).
+  frame_interval: 5
+
+  # Whisper model variant: "tiny", "base", "small", "medium", "large".
+  whisper_model_size: "small"
+
+  # Device for Whisper inference: "cpu" or "cuda".
+  whisper_device: "cpu"
+
+  # Enable/disable OCR on sampled frames.
+  enable_frame_ocr: true
+
+  # Minimum word count for a frame's OCR output to be kept.
+  ocr_min_words: 3
+
+  # Duration of each temporal chunk in seconds (transcript + OCR merge window).
+  chunk_interval: 30
+
+  # Processed output directory (relative to project root).
+  output_dir: "data/processed/videos"
+

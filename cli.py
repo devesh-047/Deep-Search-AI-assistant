@@ -4,16 +4,19 @@ Deep Search AI Assistant -- Command Line Interface
 Entry point for all user-facing operations.
 
 Commands:
-  ingest   -- Load, normalise, OCR, chunk, embed, and index a dataset
-  search   -- Semantic search over indexed documents (no LLM)
-  ask      -- RAG question answering (retrieve + LLM generation)
-  stats    -- Show index and pipeline statistics
-  devices  -- List available OpenVINO hardware devices
-  ocr-tune -- Test and tune OCR settings on sample images
+  ingest         -- Load, normalise, OCR, chunk, embed, and index a dataset
+  ingest-videos  -- Ingest video dataset (MSR-VTT captions + OCR frames) into JSON
+  search         -- Semantic search over indexed documents (no LLM)
+  ask            -- RAG question answering (retrieve + LLM generation)
+  stats          -- Show index and pipeline statistics
+  devices        -- List available OpenVINO hardware devices
+  ocr-tune       -- Test and tune OCR settings on sample images
 
 Usage examples:
   python cli.py ingest --dataset funsd
   python cli.py ingest --dataset docvqa --max-records 20
+  python cli.py ingest-videos --dataset msrvtt
+  python cli.py ingest-videos --max-videos 5
   python cli.py search "Find the invoice number"
   python cli.py ask "What is the total amount on the invoice?"
   python cli.py stats
@@ -794,6 +797,216 @@ def cmd_ocr_tune(args: argparse.Namespace) -> None:
 
 
 # ===================================================================
+# Video ingestion handler
+# ===================================================================
+
+def cmd_ingest_videos(args: argparse.Namespace) -> None:
+    """
+    Video ingestion pipeline.
+
+    Two modes depending on dataset:
+    - **Caption mode** (MSR-VTT): use pre-written captions from annotation JSON.
+      Skips audio extraction and Whisper transcription entirely.
+    - **Transcript mode** (custom datasets): extract audio → Whisper → OCR → merge.
+
+    Processed output is written to data/processed/videos/.
+    """
+    from src.video.video_loader import VideoLoader
+    from src.video.frame_sampler import FrameSampler
+    from src.video.frame_ocr import FrameOCR
+    from src.video.video_document_builder import VideoDocumentBuilder
+
+    t0 = time.time()
+
+    # ---- Read settings ------------------------------------------------
+    video_settings = SETTINGS.get("video", {})
+
+    # Video root: CLI override > settings.yaml > default
+    video_root = getattr(args, "video_root", None)
+    if not video_root:
+        video_root = video_settings.get(
+            "video_data_root",
+            "/mnt/d/Openvino-project/data/raw/archive/data/MSRVTT/MSRVTT",
+        )
+    # Handle WSL / Windows path fallback
+    video_root_path = Path(video_root)
+    if not video_root_path.exists():
+        alt = Path(r"D:\Openvino-project\data\raw\archive\data\MSRVTT\MSRVTT")
+        try:
+            if alt.exists():
+                video_root_path = alt
+                video_root = str(alt)
+        except OSError:
+            pass
+
+    frame_interval = float(video_settings.get("frame_interval", 5))
+    enable_whisper = video_settings.get("enable_whisper", False)
+    whisper_model  = video_settings.get("whisper_model_size", "small")
+    whisper_device = video_settings.get("whisper_device", "cpu")
+    enable_ocr     = video_settings.get("enable_frame_ocr", True)
+    ocr_min_words  = int(video_settings.get("ocr_min_words", 3))
+    chunk_interval = float(video_settings.get("chunk_interval", 30))
+    output_dir     = video_settings.get("output_dir", "data/processed/videos")
+    output_dir     = str(PROJECT_ROOT / output_dir)
+
+    max_videos = getattr(args, "max_videos", 0)
+    source_name = getattr(args, "dataset", "msrvtt")
+
+    _header(f"Video Ingest Pipeline  {SYM_ARROW}  source={_C.MAGENTA}{source_name}{_C.RESET}{_C.BOLD}{_C.CYAN}")
+    _info(f"Video root: {video_root}")
+    _info(f"Frame interval: {frame_interval}s | Whisper: {'ON' if enable_whisper else 'OFF (caption mode)'} | OCR: {enable_ocr}")
+    if max_videos:
+        _info(f"Max videos: {max_videos}")
+
+    # ---- Step 1: Discover videos --------------------------------------
+    _step(1, 5, "Discovering video files")
+    loader = VideoLoader(root=video_root, max_files=max_videos)
+    videos = loader.discover()
+
+    if not videos:
+        _warn(f"No video files found under {video_root}")
+        _info("Check the path and ensure .mp4/.avi/.mkv files exist.")
+        return
+
+    # Report caption info
+    videos_with_captions = sum(1 for v in videos if v.captions)
+    if videos_with_captions:
+        _done(f"Found {len(videos)} video(s) — {videos_with_captions} with pre-loaded captions")
+    else:
+        _done(f"Found {len(videos)} video file(s)")
+
+    # ---- Step 2: Initialise pipeline components -----------------------
+    _step(2, 5, "Initialising pipeline components")
+    frames_dir = str(Path(output_dir) / "frames")
+
+    frame_sampler = FrameSampler(
+        output_dir=frames_dir,
+        interval_seconds=frame_interval,
+    )
+    frame_ocr = FrameOCR(
+        min_word_count=ocr_min_words,
+    ) if enable_ocr else None
+    builder = VideoDocumentBuilder(
+        output_dir=output_dir,
+        chunk_interval=chunk_interval,
+    )
+
+    # Whisper components (only loaded if needed)
+    audio_extractor = None
+    transcriber = None
+    if enable_whisper:
+        from src.video.audio_extractor import AudioExtractor
+        from src.video.transcription import WhisperTranscriber
+        audio_dir = str(Path(output_dir) / "audio")
+        audio_extractor = AudioExtractor(output_dir=audio_dir)
+        transcriber = WhisperTranscriber(
+            model_size=whisper_model,
+            device=whisper_device,
+        )
+    _done("Components ready")
+
+    # ---- Steps 3-4: Process each video --------------------------------
+    all_docs = []
+    from tqdm import tqdm as _tqdm
+
+    pbar = _tqdm(
+        videos,
+        desc="Processing videos",
+        unit="video",
+    )
+
+    for video in pbar:
+        pbar.set_postfix_str(Path(video.video_path).name)
+        has_captions = bool(video.captions)
+
+        # ---- Transcript path (Whisper) ----------------------------
+        transcript_segments = []
+        raw_segments = []
+        if enable_whisper and not has_captions:
+            _step(3, 5, f"Transcribing: {Path(video.video_path).name}")
+            wav_path = audio_extractor.extract(video.video_path)
+            if wav_path:
+                _info("Transcribing audio...")
+                raw_segments = transcriber.transcribe(wav_path)
+                transcript_segments = transcriber.chunk_segments(
+                    raw_segments, interval=chunk_interval
+                )
+                _done(f"{len(transcript_segments)} transcript chunks")
+            else:
+                _warn("No audio — skipping transcription")
+
+        # ---- Frame sampling + OCR ---------------------------------
+        _step(3 if has_captions else 4, 5,
+              f"Extracting frames: {Path(video.video_path).name}")
+        sampled_frames = frame_sampler.sample(
+            video.video_path, video_id=video.video_id
+        )
+        _done(f"{len(sampled_frames)} frames sampled")
+
+        ocr_results = []
+        if enable_ocr and sampled_frames:
+            _step(4 if has_captions else 5, 5,
+                  f"Running OCR on frames: {Path(video.video_path).name}")
+            ocr_results = frame_ocr.extract_batch(sampled_frames)
+            _done(f"{len(ocr_results)} frames with text")
+        elif not enable_ocr:
+            _info("Frame OCR disabled in settings")
+
+        # ---- Build document ---------------------------------------
+        duration = frame_sampler.get_video_duration(video.video_path)
+
+        if has_captions:
+            # Caption mode (MSR-VTT) — use pre-loaded captions
+            _step(5, 5, f"Building document (caption mode): {video.video_id}")
+            doc = builder.build_from_captions(
+                video_id=video.video_id,
+                source=source_name,
+                captions=video.captions,
+                video_path=video.video_path,
+                duration=duration,
+                ocr_results=ocr_results,
+                extra_metadata=video.metadata,
+            )
+        else:
+            # Transcript mode (Whisper)
+            _step(5, 5, f"Building document (transcript mode): {video.video_id}")
+            doc = builder.build(
+                video_id=video.video_id,
+                source=source_name,
+                transcript_segments=(
+                    raw_segments if raw_segments else []
+                ),
+                ocr_results=ocr_results,
+                video_path=video.video_path,
+                duration=duration,
+                extra_metadata=video.metadata,
+            )
+
+        all_docs.append(doc)
+        _done(f"{len(doc.chunks)} chunks, {len(doc.text)} chars")
+
+    pbar.close()
+
+    # ---- Save all documents -------------------------------------------
+    if all_docs:
+        _info("Saving all video documents...")
+        builder.save_batch(all_docs)
+        _done(f"Saved {len(all_docs)} video documents to {output_dir}")
+
+    # ---- Summary ------------------------------------------------------
+    total_chunks = sum(len(d.chunks) for d in all_docs)
+    total_chars = sum(len(d.text) for d in all_docs)
+    _summary_table([
+        ("Videos processed",   str(len(all_docs))),
+        ("Total chunks",       str(total_chunks)),
+        ("Total characters",   str(total_chars)),
+        ("Output directory",   output_dir),
+        ("Time elapsed",       _elapsed(t0)),
+    ])
+    print(f"  {_C.GREEN}{_C.BOLD}{SYM_CHECK} Video ingestion complete{_C.RESET}\n")
+
+
+# ===================================================================
 # Argument parser
 # ===================================================================
 
@@ -931,6 +1144,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="Show single OCR comparison instead of tuning multiple configs",
     )
     p_ocr.set_defaults(func=cmd_ocr_tune)
+
+    # -- ingest-videos --
+    p_video = subparsers.add_parser(
+        "ingest-videos",
+        help="Ingest video files: extract audio, transcribe, OCR frames, build JSON",
+    )
+    p_video.add_argument(
+        "--dataset",
+        type=str,
+        default="msrvtt",
+        help="Video dataset source name (default: msrvtt)",
+    )
+    p_video.add_argument(
+        "--video-root",
+        type=str,
+        default=None,
+        dest="video_root",
+        help="Override path to video dataset directory (default: from settings.yaml)",
+    )
+    p_video.add_argument(
+        "--max-videos",
+        type=int,
+        default=0,
+        dest="max_videos",
+        help="Limit the number of videos to process (0 = all, default: 0)",
+    )
+    p_video.set_defaults(func=cmd_ingest_videos)
 
     return parser
 
