@@ -1,4 +1,4 @@
-# Deep Search AI Assistant (GSoC 2024 OpenVINO)
+# Deep Search AI Assistant (GSoC 2026 OpenVINO)
 
 An advanced multimodal RAG system designed for AI PCs, integrating local LLMs with OpenVINO optimization. This project ingests documents and videos, creating a unified knowledge base queryable via natural language.
 
@@ -177,7 +177,7 @@ AI tools were used during the development of this project for the following spec
 
 1.  **Code Structure**: Generating boilerplate command-line interface (CLI) logic and forming the repository structure.
 2.  **Documentation**: Assisting in structuring and formatting this README file.
-3.  **Debugging**: Analyzing stack traces to identify missing dependencies.
-4.  **Dataset Selection**: Suggesting appropriate public datasets (MSR-VTT) for multimodal testing.
+3.  **Debugging**: Analyzing stack traces to identify missing dependencies and for other debuggung purposes.
+4.  **Dataset Selection**: Suggesting appropriate public datasets (Eg: MSR-VTT) for multimodal testing.
 
 The core architecture, logical implementation of the RAG pipeline, OpenVINO integration strategies, and final code verification were performed manually by the developer. All code has been reviewed and validated.
