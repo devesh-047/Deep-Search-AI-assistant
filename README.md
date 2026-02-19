@@ -13,6 +13,32 @@ This application demonstrates a complete offline RAG pipeline optimized for Inte
 
 ## Architecture
 
+```text
+       [ User Query ]
+             |
+             v
+   +---------------------+
+   |   Embedding Model   |
+   |     (CPU / iGPU)    |
+   +----------+----------+
+              |
+              v
+   +---------------------+
+   |   Vector Database   |
+   |  (Context Retrieval)|
+   +----------+----------+
+              |
+              v
+   +---------------------+
+   |    LLM Inference    |
+   |     (OpenVINO™)     |
+   |    (NPU / iGPU)     |
+   +----------+----------+
+              |
+              v
+      [ Final Response ]
+```
+
 The pipeline consists of modular stages:
 
 1.  **Ingestion Layer**:
@@ -130,34 +156,48 @@ Settings are managed in `configs/settings.yaml`. Key sections:
 ## How to Run
 
 ### 1. Ingest Documents
-Processes PDFs and images from `data/raw/docs`.
+Runs the full pipeline for a document dataset: load → OCR → normalise → chunk → embed → build FAISS index.
 ```bash
-python3 cli.py ingest-documents
+# Ingest from DocVQA dataset (limit to 5 records for quick demo)
+python3 cli.py ingest --dataset docvqa --max-records 5
+
+# Ingest from FUNSD (form understanding dataset)
+python3 cli.py ingest --dataset funsd --max-records 5
+
+# Ingest full dataset (no limit)
+python3 cli.py ingest --dataset docvqa
 ```
+> **Note:** The `ingest` command builds the FAISS index automatically as its final step — no separate build step is needed.
 
 ### 2. Ingest Videos
-Processes MSR-VTT dataset.
+Processes MSR-VTT dataset into normalised JSON documents.
 ```bash
-# Default (MSR-VTT caption mode)
+# Default (MSR-VTT caption mode, all videos)
 python3 cli.py ingest-videos
+
+# Limit to 5 videos for a quick demo
+python3 cli.py ingest-videos --max-videos 5
 ```
 
-### 3. Build Index
-Creates FAISS vector index from processed data.
-```bash
-python3 cli.py build-index
-```
-
-### 4. Search
-Perform semantic search (retrieval only).
+### 3. Search
+Perform semantic search (retrieval only, no LLM).
 ```bash
 python3 cli.py search "cartoon character playing guitar"
 ```
 
-### 5. Ask (RAG)
+### 4. Ask (RAG)
 Generate answers using the LLM.
 ```bash
-python3 cli.py ask "What is the total amount on this invoice?"
+python3 cli.py ask "What is the date mentioned in the approval letter?"
+```
+
+### 5. Inspect Pipeline State
+```bash
+# Show index size, document count, LLM availability
+python3 cli.py stats
+
+# List available OpenVINO devices (CPU / iGPU / NPU)
+python3 cli.py devices
 ```
 
 ## OpenVINO Integration
