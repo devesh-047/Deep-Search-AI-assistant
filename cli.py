@@ -11,6 +11,7 @@ Commands:
   stats          -- Show index and pipeline statistics
   devices        -- List available OpenVINO hardware devices
   ocr-tune       -- Test and tune OCR settings on sample images
+  benchmark      -- Run performance benchmarks (embeddings and/or LLM)
 
 Usage examples:
   python cli.py ingest --dataset funsd
@@ -22,6 +23,9 @@ Usage examples:
   python cli.py stats
   python cli.py devices
   python cli.py ocr-tune --dataset funsd --sample 0
+  python cli.py benchmark --all
+  python cli.py benchmark --embeddings
+  python cli.py benchmark --llm
 
 Design notes:
   - Uses argparse from the standard library (no extra dependencies).
@@ -1007,6 +1011,110 @@ def cmd_ingest_videos(args: argparse.Namespace) -> None:
 
 
 # ===================================================================
+# Benchmark command
+# ===================================================================
+
+def cmd_benchmark(args: argparse.Namespace) -> None:
+    """
+    Run performance benchmarks for the embedding and/or LLM pipeline.
+
+    Flags:
+        --embeddings  Run embedding benchmark (PyTorch vs OpenVINO).
+        --llm         Run LLM benchmark (OpenVINO or Ollama).
+        --all         Run both (default when no flag is given).
+    """
+    run_embeddings = getattr(args, "embeddings", False)
+    run_llm = getattr(args, "llm", False)
+    run_all = getattr(args, "all", False)
+
+    if not run_embeddings and not run_llm:
+        run_all = True
+
+    if run_all:
+        run_embeddings = True
+        run_llm = True
+
+    batch_size = getattr(args, "batch_size", 16)
+    iterations = getattr(args, "iterations", 20)
+    warmup = getattr(args, "warmup", 3)
+
+    _header("Performance Benchmark")
+
+    # Read OpenVINO config from settings
+    ov_settings = SETTINGS.get("openvino", {})
+    ov_enabled = ov_settings.get("enabled", False)
+    model_xml = ov_settings.get("embedding_model_ir", "")
+    llm_model_dir = ov_settings.get("llm_model_dir", "")
+    ov_device = ov_settings.get("device", "CPU")
+
+    llm_settings = SETTINGS.get("llm", {})
+    ollama_model = llm_settings.get("model", "mistral")
+    ollama_endpoint = llm_settings.get("endpoint", "http://localhost:11434")
+
+    # Resolve relative model paths against project root
+    if model_xml and not Path(model_xml).is_absolute():
+        model_xml = str(PROJECT_ROOT / model_xml)
+    if llm_model_dir and not Path(llm_model_dir).is_absolute():
+        llm_model_dir = str(PROJECT_ROOT / llm_model_dir)
+
+    # ---- Embedding benchmark ----
+    if run_embeddings:
+        _step(1 if run_embeddings and run_llm else 1,
+              2 if run_embeddings and run_llm else 1,
+              "Running embedding benchmark")
+        _info(f"Batch size: {batch_size}  |  Iterations: {iterations}  |  Warmup: {warmup}")
+
+        from src.benchmark.embedding_benchmark import (
+            run_embedding_benchmark,
+            print_embedding_results,
+        )
+
+        run_ov = ov_enabled and bool(model_xml) and Path(model_xml).exists()
+        if not run_ov:
+            if not ov_enabled:
+                _warn("OpenVINO disabled in settings.yaml — embedding benchmark runs PyTorch only.")
+            else:
+                _warn(f"OpenVINO IR model not found: {model_xml}")
+                _info("Convert with: optimum-cli export openvino --model sentence-transformers/all-MiniLM-L6-v2 models/ov/all-MiniLM-L6-v2/")
+
+        emb_results = run_embedding_benchmark(
+            batch_size=batch_size,
+            n_iterations=iterations,
+            n_warmup=warmup,
+            model_xml=model_xml if run_ov else None,
+            ov_device=ov_device,
+            run_pytorch=True,
+            run_openvino=run_ov,
+        )
+        print_embedding_results(emb_results)
+
+    # ---- LLM benchmark ----
+    if run_llm:
+        _step(2 if run_embeddings else 1,
+              2 if run_embeddings and run_llm else 1,
+              "Running LLM benchmark")
+
+        from src.benchmark.llm_benchmark import (
+            run_llm_benchmark,
+            print_llm_results,
+        )
+
+        prefer_ov = ov_enabled and bool(llm_model_dir)
+        llm_results = run_llm_benchmark(
+            n_iterations=5,
+            n_warmup=1,
+            model_dir=llm_model_dir if prefer_ov else None,
+            ov_device=ov_device,
+            ollama_model=ollama_model,
+            ollama_endpoint=ollama_endpoint,
+            prefer_openvino=prefer_ov,
+        )
+        print_llm_results(llm_results)
+
+    print(f"  {_C.GREEN}{_C.BOLD}{SYM_CHECK} Benchmark complete{_C.RESET}\n")
+
+
+# ===================================================================
 # Argument parser
 # ===================================================================
 
@@ -1171,6 +1279,49 @@ def build_parser() -> argparse.ArgumentParser:
         help="Limit the number of videos to process (0 = all, default: 0)",
     )
     p_video.set_defaults(func=cmd_ingest_videos)
+
+    # -- benchmark --
+    p_bench = subparsers.add_parser(
+        "benchmark",
+        help="Run performance benchmarks (embeddings and/or LLM)",
+    )
+    p_bench.add_argument(
+        "--embeddings",
+        action="store_true",
+        help="Benchmark embedding inference (PyTorch vs OpenVINO)",
+    )
+    p_bench.add_argument(
+        "--llm",
+        action="store_true",
+        help="Benchmark LLM inference (OpenVINO or Ollama)",
+    )
+    p_bench.add_argument(
+        "--all",
+        action="store_true",
+        help="Run all benchmarks (default when no flag is given)",
+    )
+    p_bench.add_argument(
+        "--batch-size",
+        type=int,
+        default=16,
+        dest="batch_size",
+        help="Batch size for embedding benchmark (default: 16)",
+    )
+    p_bench.add_argument(
+        "--iterations",
+        type=int,
+        default=20,
+        dest="iterations",
+        help="Number of timed iterations (default: 20)",
+    )
+    p_bench.add_argument(
+        "--warmup",
+        type=int,
+        default=3,
+        dest="warmup",
+        help="Number of warmup iterations excluded from timing (default: 3)",
+    )
+    p_bench.set_defaults(func=cmd_benchmark)
 
     return parser
 

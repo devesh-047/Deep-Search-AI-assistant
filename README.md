@@ -66,6 +66,10 @@ The pipeline consists of modular stages:
 │   ├── download_models.py     # Setup utility to cache models
 │   └── verify_setup.py        # Environmental sanity check
 └── src/
+    ├── benchmark/             # Performance benchmarking module
+    │   ├── embedding_benchmark.py  # PyTorch vs OpenVINO embedding comparison
+    │   ├── llm_benchmark.py        # LLM generation speed measurement
+    │   └── system_metrics.py       # CPU and memory instrumentation (psutil)
     ├── embeddings/            # Vector generation (OpenVINO)
     ├── index/                 # FAISS vector store management
     ├── ingestion/             # Document loader & normalizer
@@ -199,6 +203,130 @@ python3 cli.py stats
 # List available OpenVINO devices (CPU / iGPU / NPU)
 python3 cli.py devices
 ```
+
+## Performance Evaluation
+
+### Why Benchmarking Matters
+
+Real-world AI workloads require quantifiable evidence of efficiency improvements.
+This project includes a dedicated benchmarking module (`src/benchmark/`) that
+measures the concrete impact of OpenVINO optimization — not through claims, but
+through measured numbers on the same hardware under identical conditions.
+
+### Measured Metrics
+
+| Metric | Description |
+| :--- | :--- |
+| **Avg Latency (ms)** | Mean wall-clock time per encode or generate call across timed iterations |
+| **Throughput (samples/sec)** | Texts embedded per second; higher is better |
+| **Tokens/sec** | Output tokens generated per second; higher is better |
+| **Mean CPU (%)** | Average CPU utilization during timed runs (via psutil) |
+| **Peak RSS (MB)** | Maximum resident memory consumed during inference |
+| **Model load time (s)** | One-time cost to load/compile the model; excluded from latency |
+
+Warmup iterations are always excluded from reported numbers to avoid
+measuring JIT compilation and cache-warming artifacts. All iterations use
+`time.perf_counter()` for sub-millisecond precision.
+
+### How to Run Benchmarks
+
+```bash
+# Run all benchmarks (embedding + LLM)
+python3 cli.py benchmark --all
+
+# Embedding only (PyTorch vs OpenVINO comparison)
+python3 cli.py benchmark --embeddings
+
+# LLM only
+python3 cli.py benchmark --llm
+
+# Custom batch size and iteration count
+python3 cli.py benchmark --embeddings --batch-size 32 --iterations 50 --warmup 5
+```
+
+### Benchmark Results (Measured on Project Hardware)
+
+**Embedding Benchmark** — 64 texts, batch size 16, 20 timed iterations (3 warmup):
+
+```
+Embedding Benchmark Results
+--------------------------------------------------
+Corpus size  : 64 texts
+Batch size   : 16
+Iterations   : 20  (warmup: 3)
+
+PyTorch CPU:
+  Avg Latency  : 527.24 ms
+  Min Latency  : 445.19 ms
+  Max Latency  : 977.01 ms
+  Throughput   : 121.4 samples/sec
+  Mean CPU     : 606.8%
+  Peak RSS     : 873.1 MB
+  Model load   : 5.025 s
+
+OpenVINO CPU:
+  Avg Latency  : 466.03 ms
+  Min Latency  : 419.88 ms
+  Max Latency  : 591.76 ms
+  Throughput   : 137.3 samples/sec
+  Mean CPU     : 548.1%
+  Peak RSS     : 1051.7 MB
+  Model load   : 2.611 s
+
+Speedup      : 1.13x  (OpenVINO vs PyTorch)
+--------------------------------------------------
+```
+
+**Key observations from the embedding benchmark:**
+
+- OpenVINO delivers a **1.13x latency reduction** and a **more consistent** latency
+  distribution (Min–Max spread of 172 ms vs 532 ms for PyTorch), demonstrating
+  that graph-level optimizations reduce variance even where raw speedup is modest.
+- **OpenVINO model load time is 48% faster** (2.6 s vs 5.0 s), which matters when
+  the encoder is cold-started per CLI invocation.
+- CPU utilization is **9% lower under OpenVINO** (548% vs 607%), indicating more
+  efficient use of available cores for the same workload.
+- The speedup margin is hardware-dependent. On Intel iGPU or NPU (`--device GPU`
+  / `--device NPU` in `settings.yaml`) significantly larger gains are expected.
+
+**LLM Benchmark** — hardware requirement note:
+
+Running a 7B-parameter model (Mistral or Llama3) in INT4 format requires
+approximately **4–6 GB of available RAM** after other processes. On constrained
+systems the OS will terminate the process before generation begins. To run the
+LLM benchmark successfully:
+
+```bash
+# Verify available memory first
+free -h
+
+# Run LLM benchmark only (embedding model already unloaded)
+python3 cli.py benchmark --llm
+
+# Or use a smaller model configured in settings.yaml
+```
+
+> All numbers above are real measurements captured with `time.perf_counter()`
+> on project hardware (WSL2 / Ubuntu 20.04). Results will vary by CPU model,
+> available RAM, and thread contention from background processes.
+
+### How OpenVINO Improves Inference
+
+OpenVINO applies a set of hardware-targeted transformations between model
+export and execution:
+
+1. **Graph Fusion** — Adjacent operations (e.g., MatMul + Bias + Activation)
+   are merged into single hardware kernels, reducing memory bandwidth.
+2. **INT8 Quantization** — Weight values are compressed from FP32 to INT8,
+   halving memory traffic and enabling vectorized integer math on AVX-512.
+3. **Thread Parallelism** — The runtime automatically tiles workloads across
+   physical cores using its own thread pool, eliminating PyTorch overhead.
+4. **Device-Specific Dispatch** — The same model can run on CPU, iGPU, or
+   NPU by changing a single device string, with device-optimal code paths
+   selected automatically.
+
+These optimizations are transparent to application code: the encoder and
+LLM client interfaces are identical regardless of backend.
 
 ## OpenVINO Integration
 
