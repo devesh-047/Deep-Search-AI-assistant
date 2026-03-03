@@ -1,20 +1,61 @@
+# ============================================================
+# Deep Search AI Assistant -- Python Dependencies
+# Install: pip install -r requirements.txt
+# ============================================================
+
+# --- Core scientific stack ---
 numpy
+psutil
+
+# --- Progress & utilities ---
 tqdm
 pyyaml
-faiss-cpu
-sentence-transformers
-protobuf
 requests
-pillow
-opencv-python
-pytesseract
-openvino>=2024.0
-openvino-tokenizers
-openvino-genai
-optimum-intel
-nncf
+protobuf
+
+# --- Embeddings & NLP ---
+sentence-transformers>=2.2.0
+transformers>=4.30.0          # direct use: AutoTokenizer in chunker.py
+torch>=2.0.0                  # backend for sentence-transformers
+
+# --- Vector database ---
+faiss-cpu
+
+# --- HuggingFace datasets (used by loader.py for Arrow format) ---
+datasets>=2.14.0
+huggingface-hub>=0.16.0
+
+# --- Document ingestion ---
+pdfplumber                    # PDF text extraction (loader.py)
+python-docx                   # DOCX extraction    (loader.py)
+python-pptx                   # PPTX extraction    (loader.py)
+pillow                        # Image handling
+
+# --- OCR ---
+pytesseract                   # Tesseract OCR engine
+opencv-python                 # Image preprocessing for OCR
+
+# --- Language detection (optional but used in normalizer.py) ---
+langdetect
+
+# --- Video ingestion ---
+openai-whisper                # Audio transcription
+moviepy>=1.0.3                # Video frame / audio extraction
+
+# --- ONNX export ---
 onnx
 onnxruntime
-openai-whisper
-moviepy
-psutil
+
+# --- OpenVINO inference stack ---
+# Install these AFTER base packages to avoid resolver conflicts.
+# On non-Intel hardware these are still safe to install (CPU fallback).
+openvino>=2024.0
+openvino-tokenizers>=2024.0
+openvino-genai>=2024.0
+optimum-intel>=1.16.0         # provides: from optimum.intel import OVModelForCausalLM
+nncf>=2.7.0                   # Neural Network Compression Framework
+
+# --- Optional: PaddleOCR (alternate OCR engine) ---
+# Uncomment if you want PaddleOCR support:
+# paddlepaddle
+# paddleocr>=2.7.0

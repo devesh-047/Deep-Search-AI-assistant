@@ -364,6 +364,49 @@ def cmd_ingest(args: argparse.Namespace) -> None:
     # --- Step 6: Build FAISS index ---
     _step(6, 6, "Building FAISS index")
     chunk_metadata = [c.to_dict() for c in chunks]
+
+    # Enrich chunk metadata with structured fields for metadata-aware retrieval.
+    # This is backward-compatible — it only adds new keys, never overwrites.
+    try:
+        from src.retrieval.metadata_filter import enrich_chunk_metadata
+
+        # Dataset names whose source documents are scanned images/forms.
+        _IMAGE_DATASETS = {"funsd", "docvqa", "rvl_cdip"}
+
+        for cm in chunk_metadata:
+            meta = cm.get("metadata", {})
+            doc_id = cm.get("doc_id", "")
+            dataset_name = meta.get("dataset", "")
+
+            # Infer modality and file_type.
+            # Priority: explicitly stored values > dataset-name heuristic.
+            stored_file_type = meta.get("file_type") or ""
+            stored_modality  = meta.get("modality")  or ""
+
+            if stored_modality:
+                modality = stored_modality
+            elif dataset_name in _IMAGE_DATASETS:
+                modality = "image"
+            else:
+                modality = "text"
+
+            if stored_file_type:
+                file_type = stored_file_type
+            elif dataset_name in _IMAGE_DATASETS:
+                file_type = "image"
+            else:
+                file_type = ""
+
+            enrich_chunk_metadata(
+                cm,
+                file_name=meta.get("file_name", doc_id),
+                file_type=file_type,
+                source_directory=meta.get("source_directory", ""),
+                modality=modality,
+            )
+    except ImportError:
+        pass  # metadata enrichment is optional
+
     index = FaissIndex(dimension=encoder.dimension)
     index.build(embeddings, chunk_metadata)
     index.save(str(INDEX_DIR))
@@ -426,8 +469,28 @@ def cmd_search(args: argparse.Namespace) -> None:
         _info("Run:  python cli.py ingest --dataset <name>")
         sys.exit(1)
 
-    retriever = Retriever(encoder=encoder, index=index)
-    results = retriever.query(query, top_k=top_k)
+    use_metadata = getattr(args, "metadata_filtering", False)
+
+    if use_metadata:
+        # Metadata-aware staged retrieval path
+        from src.retrieval.metadata_filter import MetadataStore, StagedRetriever, QueryMetadataParser
+        metadata_store = MetadataStore(index.metadata)
+        staged = StagedRetriever(
+            encoder=encoder, index=index,
+            metadata_store=metadata_store,
+            parser=QueryMetadataParser(),
+        )
+        raw_results, stats = staged.query(query, top_k=top_k)
+        # Wrap into RetrieverResult for display
+        retriever = Retriever(encoder=encoder, index=index)
+        results = retriever._wrap_results(raw_results)
+        if stats.get("constraints_detected"):
+            _info(f"Metadata constraints: {stats['constraints_detected']}")
+            _info(f"Pre-filter: {stats['candidates_before_filter']} -> {stats['candidates_after_filter']} candidates")
+            _info(f"Retrieval latency: {stats['retrieval_latency_ms']:.1f} ms")
+    else:
+        retriever = Retriever(encoder=encoder, index=index)
+        results = retriever.query(query, top_k=top_k)
 
     if not results:
         _warn("No results found.")
@@ -444,6 +507,8 @@ def cmd_search(args: argparse.Namespace) -> None:
         print()
 
     _info(f"Showing {len(results)} result(s) for top_k={top_k}")
+    if use_metadata:
+        _info("Mode: metadata-aware staged retrieval")
     print()
 
 
@@ -494,9 +559,27 @@ def cmd_ask(args: argparse.Namespace) -> None:
 
     # Retrieve context
     _step(1, 2, "Retrieving relevant context")
-    retriever = Retriever(encoder=encoder, index=index)
-    results = retriever.query(question, top_k=top_k)
-    context = retriever.format_context(results, max_chars=3000)
+    use_metadata = getattr(args, "metadata_filtering", False)
+
+    if use_metadata:
+        from src.retrieval.metadata_filter import MetadataStore, StagedRetriever, QueryMetadataParser
+        metadata_store = MetadataStore(index.metadata)
+        staged = StagedRetriever(
+            encoder=encoder, index=index,
+            metadata_store=metadata_store,
+            parser=QueryMetadataParser(),
+        )
+        raw_results, stats = staged.query(question, top_k=top_k)
+        retriever = Retriever(encoder=encoder, index=index)
+        results = retriever._wrap_results(raw_results)
+        context = retriever.format_context(results, max_chars=3000)
+        if stats.get("constraints_detected"):
+            _info(f"Metadata constraints: {stats['constraints_detected']}")
+            _info(f"Pre-filter: {stats['candidates_before_filter']} -> {stats['candidates_after_filter']} candidates")
+    else:
+        retriever = Retriever(encoder=encoder, index=index)
+        results = retriever.query(question, top_k=top_k)
+        context = retriever.format_context(results, max_chars=3000)
 
     if not results:
         _warn("No relevant context found in the knowledge base.")
@@ -1183,6 +1266,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override OpenVINO device (CPU, GPU, NPU, AUTO). Default: from settings.yaml",
     )
+    p_search.add_argument(
+        "--metadata-filtering",
+        action="store_true",
+        dest="metadata_filtering",
+        help="Enable metadata-aware staged retrieval (pre-filter by year/type/directory)",
+    )
     p_search.set_defaults(func=cmd_search)
 
     # -- ask --
@@ -1207,6 +1296,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Override OpenVINO device (CPU, GPU, NPU, AUTO). Default: from settings.yaml",
+    )
+    p_ask.add_argument(
+        "--metadata-filtering",
+        action="store_true",
+        dest="metadata_filtering",
+        help="Enable metadata-aware staged retrieval (pre-filter by year/type/directory)",
     )
     p_ask.set_defaults(func=cmd_ask)
 

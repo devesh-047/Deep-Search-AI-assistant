@@ -338,6 +338,21 @@ This project explicitly leverages OpenVINO for:
 
 Device selection (`CPU`, `GPU`, `NPU`) is configurable in `settings.yaml`.
 
+## Metadata-Aware Staged Retrieval (Enhancement)
+
+An optional metadata pre-filtering stage can be enabled to narrow the vector search space before ANN search. This improves relevance and reduces latency for queries that reference specific years, file types, or content modalities.
+
+```bash
+# Enable with --metadata-filtering flag
+python3 cli.py search "Find 2024 invoices" --metadata-filtering
+python3 cli.py ask "What is in the presentation slides?" --metadata-filtering
+
+# Run comparison benchmark
+python3 scripts/compare_retrieval_modes.py
+```
+
+See [README_metadata_retrieval.md](README_metadata_retrieval.md) for full documentation on architecture, usage, and interpretation.
+
 ## AI Usage Disclosure
 
 **Use of AI Assistance**:
