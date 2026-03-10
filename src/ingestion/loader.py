@@ -179,10 +179,11 @@ def _extract_text_from_pdf(file_path: str) -> str:
 
 def _extract_text_from_docx(file_path: str) -> str:
     """
-    Extract text from a DOCX file using **python-docx**.
+    Extract structured text from a DOCX file using **python-docx**.
 
-    Iterates over every paragraph in the document and joins them with
-    newlines.
+    Extracts headings (prefixed with ``Heading:``), paragraphs, and tables
+    (formatted as pipe-separated rows).  The output is a single string
+    suitable for downstream chunking and embedding.
 
     Parameters
     ----------
@@ -192,7 +193,7 @@ def _extract_text_from_docx(file_path: str) -> str:
     Returns
     -------
     str
-        The concatenated plain-text content of all paragraphs.
+        Structured plain-text content of the document.
 
     Raises
     ------
@@ -207,17 +208,60 @@ def _extract_text_from_docx(file_path: str) -> str:
             "Install it with:  pip install python-docx"
         )
 
-    doc = docx.Document(file_path)
-    return "\n".join(paragraph.text for paragraph in doc.paragraphs if paragraph.text)
+    try:
+        doc = docx.Document(file_path)
+    except Exception as exc:
+        logger.warning("Failed to open DOCX file %s: %s", file_path, exc)
+        return ""
+
+    parts: List[str] = []
+
+    # -- Paragraphs and headings --
+    for paragraph in doc.paragraphs:
+        text = paragraph.text.strip()
+        if not text:
+            continue
+        style_name = (paragraph.style.name or "").lower()
+        if "heading" in style_name:
+            parts.append(f"Heading: {text}")
+        else:
+            parts.append(f"Paragraph:\n{text}")
+
+    # -- Tables --
+    for table in doc.tables:
+        rows_text: List[str] = []
+        for row in table.rows:
+            cells = [cell.text.strip() for cell in row.cells]
+            rows_text.append(" | ".join(cells))
+        if rows_text:
+            parts.append("Table:\n" + "\n".join(rows_text))
+
+    return "\n\n".join(parts)
+
+
+def _extract_docx_metadata(file_path: str) -> dict:
+    """Return DOCX-specific metadata (paragraph and table counts)."""
+    try:
+        import docx
+        doc = docx.Document(file_path)
+        return {
+            "paragraph_count": len([p for p in doc.paragraphs if p.text.strip()]),
+            "table_count": len(doc.tables),
+        }
+    except Exception:
+        return {}
 
 
 def _extract_text_from_pptx(file_path: str) -> str:
     """
-    Extract text from a PPTX file using **python-pptx**.
+    Extract structured text from a PPTX file using **python-pptx**.
 
-    Iterates over every slide, then every shape with a text frame, and
-    concatenates all paragraph text.  Slides are separated by double
-    newlines.
+    Produces slide-numbered output with titles, content text, and tables.
+    Each slide is formatted as::
+
+        Slide 1
+        Title: Introduction
+        Content: ...
 
     Parameters
     ----------
@@ -227,7 +271,7 @@ def _extract_text_from_pptx(file_path: str) -> str:
     Returns
     -------
     str
-        The concatenated plain-text content of all slides.
+        Structured plain-text content of all slides.
 
     Raises
     ------
@@ -236,24 +280,67 @@ def _extract_text_from_pptx(file_path: str) -> str:
     """
     try:
         from pptx import Presentation
+        from pptx.util import Inches  # noqa: F401 – validates pptx install
     except ImportError:
         raise ImportError(
             "The 'python-pptx' library is required to extract text from PPTX files.  "
             "Install it with:  pip install python-pptx"
         )
 
-    prs = Presentation(file_path)
+    try:
+        prs = Presentation(file_path)
+    except Exception as exc:
+        logger.warning("Failed to open PPTX file %s: %s", file_path, exc)
+        return ""
+
     slides_text: List[str] = []
-    for slide in prs.slides:
-        parts: List[str] = []
+    for slide_num, slide in enumerate(prs.slides, 1):
+        slide_parts: List[str] = [f"Slide {slide_num}"]
+
+        # -- Title --
+        title = ""
+        if slide.shapes.title and slide.shapes.title.text.strip():
+            title = slide.shapes.title.text.strip()
+            slide_parts.append(f"Title: {title}")
+
+        # -- Text content (excluding title shape to avoid duplication) --
+        content_lines: List[str] = []
         for shape in slide.shapes:
+            # Skip the title shape if already captured
+            if slide.shapes.title and shape.shape_id == slide.shapes.title.shape_id:
+                continue
             if shape.has_text_frame:
                 for paragraph in shape.text_frame.paragraphs:
-                    if paragraph.text.strip():
-                        parts.append(paragraph.text)
-        if parts:
-            slides_text.append("\n".join(parts))
+                    text = paragraph.text.strip()
+                    if text:
+                        content_lines.append(text)
+            # -- Tables on slides --
+            if shape.has_table:
+                rows_text: List[str] = []
+                for row in shape.table.rows:
+                    cells = [cell.text.strip() for cell in row.cells]
+                    rows_text.append(" | ".join(cells))
+                if rows_text:
+                    content_lines.append("Table:\n" + "\n".join(rows_text))
+
+        if content_lines:
+            slide_parts.append("Content: " + "\n".join(content_lines))
+
+        # Only include slides that have at least a title or content.
+        if len(slide_parts) > 1:
+            slides_text.append("\n".join(slide_parts))
+
     return "\n\n".join(slides_text)
+
+
+def _extract_pptx_metadata(file_path: str) -> dict:
+    """Return PPTX-specific metadata (slide count)."""
+    try:
+        from pptx import Presentation
+        prs = Presentation(file_path)
+        return {"slide_count": len(prs.slides)}
+    except Exception:
+        return {}
 
 
 # Map file extensions to their extraction functions.
@@ -530,11 +617,24 @@ class DatasetLoader:
                     logger.warning("Failed to extract text from %s: %s",
                                    file_path, exc)
                     text = ""
+
+                # Build enriched metadata for this file.
+                meta: Dict = {
+                    "file_type": ext,
+                    "file_name": file_path.name,
+                    "source_directory": str(root),
+                }
+                # Format-specific metadata.
+                if ext == ".docx":
+                    meta.update(_extract_docx_metadata(str(file_path)))
+                elif ext == ".pptx":
+                    meta.update(_extract_pptx_metadata(str(file_path)))
+
                 documents.append(RawDocument(
                     doc_key=rel,
                     source=str(file_path),
                     text=text,
-                    metadata={"file_type": ext},
+                    metadata=meta,
                 ))
 
             # Image files -- defer to OCR.
@@ -544,7 +644,11 @@ class DatasetLoader:
                     source=str(file_path),
                     text="",
                     image_path=str(file_path.resolve()),
-                    metadata={"file_type": ext},
+                    metadata={
+                        "file_type": ext,
+                        "file_name": file_path.name,
+                        "source_directory": str(root),
+                    },
                 ))
             else:
                 logger.debug("Skipping unsupported file: %s", file_path)
@@ -552,6 +656,73 @@ class DatasetLoader:
         logger.info("Directory '%s': %d documents loaded", dir_path,
                      len(documents))
         return documents
+
+    def load_path(self, path: str,
+                  max_records: int = 0) -> List[RawDocument]:
+        """
+        Load documents from a local file **or** directory.
+
+        This is a convenience entry-point for the ``--path`` CLI mode.
+        If *path* points to a single file it is loaded directly; if it
+        points to a directory, ``load_directory`` is used.
+
+        Parameters
+        ----------
+        path : str
+            Path to a single file or a directory.
+        max_records : int
+            If > 0, load at most this many files.
+
+        Returns
+        -------
+        list of RawDocument
+        """
+        p = Path(path)
+        if not p.exists():
+            raise FileNotFoundError(f"Path not found: {p}")
+
+        if p.is_dir():
+            return self.load_directory(str(p), max_records=max_records)
+
+        # --- Single file ---
+        ext = p.suffix.lower()
+        if ext in _FILE_EXTRACTORS:
+            try:
+                text = _FILE_EXTRACTORS[ext](str(p))
+            except Exception as exc:
+                logger.warning("Failed to extract text from %s: %s", p, exc)
+                text = ""
+            meta: Dict = {
+                "file_type": ext,
+                "file_name": p.name,
+                "source_directory": str(p.parent),
+            }
+            if ext == ".docx":
+                meta.update(_extract_docx_metadata(str(p)))
+            elif ext == ".pptx":
+                meta.update(_extract_pptx_metadata(str(p)))
+            return [RawDocument(
+                doc_key=p.name,
+                source=str(p),
+                text=text,
+                metadata=meta,
+            )]
+
+        if ext in _IMAGE_EXTENSIONS:
+            return [RawDocument(
+                doc_key=p.name,
+                source=str(p),
+                text="",
+                image_path=str(p.resolve()),
+                metadata={
+                    "file_type": ext,
+                    "file_name": p.name,
+                    "source_directory": str(p.parent),
+                },
+            )]
+
+        logger.warning("Unsupported file type: %s", p)
+        return []
 
     def list_available_datasets(self) -> List[str]:
         """Return names of subdirectories under raw_data_root."""

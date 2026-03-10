@@ -107,8 +107,12 @@ class DeviceManager:
         self._settings = load_settings()
 
         # Initialise OpenVINO
+        # openvino.runtime was removed in OpenVINO 2024+; Core lives in openvino directly.
         try:
-            from openvino.runtime import Core
+            try:
+                from openvino import Core
+            except ImportError:
+                from openvino.runtime import Core  # fallback for older versions
             self._core = Core()
             self._devices = self._core.available_devices
             logger.info("OpenVINO devices: %s", self._devices)

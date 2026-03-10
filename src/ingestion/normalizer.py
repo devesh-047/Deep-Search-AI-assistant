@@ -329,6 +329,16 @@ class DocumentNormalizer:
             return "document_image"
         elif dataset == "rvl_cdip":
             return "classified_image"
+
+        # File-type based classification for loose-file ingestion.
+        file_type = raw.metadata.get("file_type", "")
+        if file_type == ".docx":
+            return "docx"
+        elif file_type == ".pptx":
+            return "pptx"
+        elif file_type == ".pdf":
+            return "pdf"
+
         # Fallback for file-based loading paths.
         if raw.image_path:
             return "image"

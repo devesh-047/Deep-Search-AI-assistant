@@ -112,7 +112,8 @@ The system is designed to handle diverse multimodal inputs:
 
 | Data Type | Supported Formats | Processing Method |
 | :--- | :--- | :--- |
-| **Documents** | `.pdf`, `.png`, `.jpg`, `.jpeg`, `.tiff` | OCR (Tesseract) + Text Normalization |
+| **Documents** | `.pdf`, `.docx`, `.pptx`, `.txt` | Text extraction (pdfplumber / python-docx / python-pptx) |
+| **Images** | `.png`, `.jpg`, `.jpeg`, `.tiff`, `.bmp` | OCR (Tesseract) + Text Normalization |
 | **Videos** | `.mp4`, `.avi`, `.mov`, `.mkv` | Frame Sampling + Audio Transcription (Whisper) + Caption Integration |
 | **Metadata** | `.json`, `.txt` | Structural parsing (e.g., MSR-VTT annotations) |
 
@@ -147,6 +148,128 @@ The system is designed to handle diverse multimodal inputs:
     sudo apt update
     sudo apt install ffmpeg tesseract-ocr
     ```
+
+## LLM Setup
+
+The system supports two LLM backends. You only need **one** of them.
+
+---
+
+### Option A — Ollama (recommended for getting started)
+
+Ollama runs Mistral locally over a REST API. No GPU required.
+
+**1. Install Ollama**
+```bash
+curl -fsSL https://ollama.com/install.sh | sh
+```
+On Windows/WSL, download the installer from https://ollama.com/download.
+
+**2. Start the Ollama server**
+```bash
+ollama serve
+```
+Keep this running in a separate terminal (or run it as a background service).
+
+**3. Pull the Mistral model**
+```bash
+ollama pull mistral
+```
+This downloads ~4 GB. Run it once — the model is cached afterwards.
+
+**4. Verify it works**
+```bash
+ollama run mistral "Hello, what are you?"
+```
+
+**5. Configure the project to use Ollama**
+
+In `configs/settings.yaml`, set:
+```yaml
+llm:
+  provider: ollama
+  model: mistral
+  endpoint: http://localhost:11434
+```
+
+That's it. `python cli.py ask "..."` will now use Ollama automatically.
+
+---
+
+### Option B — OpenVINO GenAI (on-device, no server needed)
+
+OpenVINO runs the LLM directly on Intel CPU / iGPU / NPU without Ollama.
+This is faster on Intel hardware and requires no background server.
+
+**1. Convert a model to OpenVINO IR format**
+
+Install the conversion tool if not already present:
+```bash
+pip install optimum-intel[openvino]
+```
+
+Convert Mistral 7B Instruct with INT4 weight compression (requires ~4 GB disk):
+```bash
+optimum-cli export openvino \
+    --model mistralai/Mistral-7B-Instruct-v0.2 \
+    --weight-format int4 \
+    models/ov/mistral-7b-instruct
+```
+
+Or convert a smaller model for lower-memory systems (Phi-3 Mini, ~2 GB):
+```bash
+optimum-cli export openvino \
+    --model microsoft/Phi-3-mini-4k-instruct \
+    --weight-format int4 \
+    models/ov/phi-3-mini
+```
+
+**2. Configure the project to use OpenVINO**
+
+In `configs/settings.yaml`, set:
+```yaml
+llm:
+  provider: openvino
+
+openvino:
+  enabled: true
+  device: CPU          # or GPU, NPU, AUTO
+  llm_model_dir: models/ov/mistral-7b-instruct
+```
+
+**3. Select the best device**
+```bash
+# List available Intel devices (CPU / iGPU / NPU)
+python3 cli.py devices
+```
+
+| Device | Use when |
+| :--- | :--- |
+| `CPU` | Always available, good baseline |
+| `GPU` | Intel iGPU (Iris Xe) — faster than CPU for large models |
+| `NPU` | Intel AI Boost NPU (Core Ultra) — lowest power, good for inference |
+| `AUTO` | Let OpenVINO pick the best available device automatically |
+
+Set your preferred device in `configs/settings.yaml` under `openvino.device`.
+
+**4. Verify**
+```bash
+python3 cli.py ask "What is in the document?"
+```
+The pipeline will log `Using OpenVINO LLM from models/ov/...` when the backend is active.
+
+---
+
+### Switching between backends
+
+Edit `configs/settings.yaml` and change `llm.provider`:
+
+```yaml
+llm:
+  provider: ollama      # ← change to "openvino" to switch
+```
+
+No code changes required.
 
 ## Configuration
 
@@ -352,6 +475,84 @@ python3 scripts/compare_retrieval_modes.py
 ```
 
 See [README_metadata_retrieval.md](README_metadata_retrieval.md) for full documentation on architecture, usage, and interpretation.
+
+## Multimodal Document Support
+
+The ingestion pipeline supports the following document types out of the box:
+
+| Format | Library | Extracted Content |
+| :--- | :--- | :--- |
+| **PDF** | `pdfplumber` | Full page text |
+| **DOCX** | `python-docx` | Headings, paragraphs, and tables (pipe-separated) |
+| **PPTX** | `python-pptx` | Slide-numbered output with titles, content text, and tables |
+| **Images** | Tesseract / PaddleOCR | OCR-extracted text |
+| **Videos** | Whisper + OpenCV | Captions, audio transcription, and frame OCR |
+| **TXT** | Built-in | Raw text |
+
+All formats are normalised into the unified `NormalizedDocument` schema and indexed identically.
+
+### DOCX Output Format
+
+DOCX files are extracted with structural markers:
+
+```
+Heading: Project Plan
+
+Paragraph:
+This document describes the project timeline.
+
+Table:
+Task | Owner | Deadline
+Design | Alice | 2024-01-15
+Build | Bob | 2024-03-01
+```
+
+### PPTX Output Format
+
+PPTX files are extracted with slide numbering and titles:
+
+```
+Slide 1
+Title: Introduction
+Content: Welcome to the quarterly review.
+
+Slide 2
+Title: Results
+Content: Revenue increased by 15%.
+Table:
+Quarter | Revenue
+Q1 | $1.2M
+Q2 | $1.4M
+```
+
+## Local File Query Mode
+
+You can ingest a local file or directory and ask a question in a single command.
+The system will automatically ingest, index, retrieve, and answer.
+
+```bash
+# Query a directory of documents
+python cli.py --path ./documents --ask "What is the payment amount?"
+
+# Query a single file
+python cli.py --path ./report.pdf --ask "Summarize this document"
+
+# With metadata-aware filtering
+python cli.py --path ./docs --ask "Find invoices from 2019" --metadata-filtering
+
+# Control the number of retrieved chunks
+python cli.py --path ./docs --ask "Key findings" --top-k 10
+```
+
+The pipeline executes:
+
+1. **Load** — Detect file types and extract text (PDF, DOCX, PPTX, TXT, images)
+2. **OCR** — Run Tesseract/PaddleOCR on image files
+3. **Normalise** — Clean text, detect language, deduplicate
+4. **Chunk** — Split text into 512-character passages with overlap
+5. **Embed** — Generate dense embeddings (PyTorch or OpenVINO)
+6. **Index** — Build FAISS vector index
+7. **Retrieve + Answer** — Semantic search + LLM-generated answer
 
 ## AI Usage Disclosure
 

@@ -1198,6 +1198,259 @@ def cmd_benchmark(args: argparse.Namespace) -> None:
 
 
 # ===================================================================
+# Local path query handler  (--path / --ask)
+# ===================================================================
+
+def cmd_path_query(args: argparse.Namespace) -> None:
+    """
+    One-shot pipeline: ingest a local file/directory, build an index,
+    retrieve context, and answer a question with the LLM.
+
+    Triggered by::
+
+        python cli.py --path ./docs --ask "What is the payment amount?"
+    """
+    input_path = args.path
+    question = getattr(args, "ask", None)
+    top_k = getattr(args, "top_k", 5)
+    use_metadata = getattr(args, "metadata_filtering", False)
+    t0 = time.time()
+
+    if not question:
+        _error("--ask is required when using --path.")
+        _info("Usage: python cli.py --path ./docs --ask \"Your question\"")
+        sys.exit(1)
+
+    target = Path(input_path)
+    if not target.exists():
+        _error(f"Path not found: {target}")
+        sys.exit(1)
+
+    from src.ingestion.loader import DatasetLoader, RawDocument
+    from src.ingestion.normalizer import DocumentNormalizer
+    from src.ingestion.chunker import TextChunker
+    from src.embeddings.encoder import EmbeddingEncoder
+    from src.index.faiss_index import FaissIndex
+    from src.retrieval.retriever import Retriever
+
+    _header(f"Path Query  {SYM_ARROW}  {_C.MAGENTA}{target}{_C.RESET}{_C.BOLD}{_C.CYAN}")
+    _info(f"Question: {question}")
+
+    total_steps = 7
+
+    # ---- Step 1: Load documents from path ----
+    _step(1, total_steps, "Loading documents from path")
+    # DatasetLoader requires a raw_data_root that exists; use the path's
+    # parent (for a file) or the path itself (for a directory).
+    anchor = str(target.parent if target.is_file() else target)
+    loader = DatasetLoader(
+        raw_data_root=anchor,
+        image_cache_dir=str(OCR_CACHE_DIR),
+    )
+    try:
+        raw_docs = loader.load_path(str(target))
+    except Exception as exc:
+        _error(f"Failed to load documents: {exc}")
+        sys.exit(1)
+
+    if not raw_docs:
+        _warn("No documents found at the provided path.")
+        return
+    _done(f"{len(raw_docs)} document(s) loaded")
+
+    # ---- Step 2: OCR for image documents ----
+    _step(2, total_steps, "Running OCR on image documents")
+    ocr_count = 0
+    ocr_settings = SETTINGS.get("ocr", {})
+    engine_name = ocr_settings.get("engine", "tesseract").lower()
+    ocr_engine = None
+    try:
+        if engine_name == "paddleocr":
+            try:
+                from src.ocr.paddle_engine import PaddleOCREngine
+                paddle_lang = ocr_settings.get("paddleocr_lang", "en")
+                use_ov = ocr_settings.get("paddleocr_use_openvino", False)
+                ocr_engine = PaddleOCREngine(
+                    lang=paddle_lang, use_openvino=use_ov, device="CPU",
+                    confidence_threshold=ocr_settings.get("confidence_threshold", 40),
+                )
+            except ImportError:
+                pass
+        if ocr_engine is None:
+            from src.ocr.tesseract_engine import TesseractEngine
+            ocr_engine = TesseractEngine(
+                lang=ocr_settings.get("tesseract_lang", "eng"),
+                preprocess=ocr_settings.get("preprocess", True),
+                confidence_threshold=ocr_settings.get("confidence_threshold", 40),
+            )
+        images_to_ocr = []
+        image_doc_map = {}
+        for doc in raw_docs:
+            if doc.image_path and not doc.text:
+                images_to_ocr.append(doc.image_path)
+                image_doc_map[doc.image_path] = doc
+        if images_to_ocr:
+            ocr_results = ocr_engine.batch_extract(images_to_ocr)
+            for image_path, extracted_text in ocr_results:
+                if extracted_text:
+                    image_doc_map[image_path].text = extracted_text
+                    ocr_count += 1
+            _done(f"Extracted text from {ocr_count} images")
+        else:
+            _info("No images needed OCR")
+    except ImportError as e:
+        _warn(f"OCR skipped — {e}")
+
+    # ---- Step 3: Normalise ----
+    _step(3, total_steps, "Normalising documents")
+    normalizer = DocumentNormalizer(output_dir=str(NORMALISED_DIR))
+    norm_docs = normalizer.normalize(raw_docs)
+    normalizer.save(norm_docs)
+    _done(f"{len(norm_docs)} document(s) normalised")
+
+    # ---- Step 4: Chunk ----
+    _step(4, total_steps, "Chunking text into passages")
+    chunker = TextChunker(chunk_size=512, overlap=64)
+    docs_with_text = [d for d in norm_docs if d.text.strip()]
+    chunks = chunker.chunk_documents(docs_with_text)
+    if not chunks:
+        _warn("No text chunks produced — documents may lack extractable text.")
+        return
+    _done(f"{len(chunks)} chunks from {len(docs_with_text)} document(s)")
+
+    # ---- Step 5: Embed ----
+    _step(5, total_steps, "Generating embeddings")
+    encoder = None
+    try:
+        from src.openvino.device_manager import DeviceManager
+        dm = DeviceManager()
+        if dm.is_openvino_enabled():
+            model_ir = dm.get_embedding_model_path()
+            ov_device = dm.select_from_settings()
+            if model_ir and Path(model_ir).exists():
+                from src.embeddings.openvino_encoder import OVEmbeddingEncoder
+                encoder = OVEmbeddingEncoder(model_xml=model_ir, device=ov_device)
+    except Exception:
+        pass
+    if encoder is None:
+        encoder = EmbeddingEncoder(device="cpu")
+
+    chunk_texts = [c.text for c in chunks]
+    embeddings = encoder.encode(chunk_texts, batch_size=64, show_progress=True)
+    EMBEDDINGS_DIR.mkdir(parents=True, exist_ok=True)
+    import numpy as _np
+    _np.save(str(EMBEDDINGS_DIR / "chunk_embeddings.npy"), embeddings)
+    _done(f"Shape {embeddings.shape}  ({embeddings.dtype})")
+
+    # ---- Step 6: Build FAISS index ----
+    _step(6, total_steps, "Building FAISS index")
+    chunk_metadata = [c.to_dict() for c in chunks]
+
+    # Enrich chunk metadata for metadata-aware retrieval.
+    try:
+        from src.retrieval.metadata_filter import enrich_chunk_metadata
+        for cm in chunk_metadata:
+            meta = cm.get("metadata", {})
+            doc_id = cm.get("doc_id", "")
+            file_type = meta.get("file_type", "")
+            modality = meta.get("modality", "")
+
+            # Infer modality from file_type when not explicitly set.
+            if not modality:
+                if file_type in (".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp"):
+                    modality = "image"
+                else:
+                    modality = "text"
+
+            enrich_chunk_metadata(
+                cm,
+                file_name=meta.get("file_name", doc_id),
+                file_type=file_type,
+                source_directory=meta.get("source_directory", ""),
+                modality=modality,
+            )
+    except ImportError:
+        pass
+
+    index = FaissIndex(dimension=encoder.dimension)
+    index.build(embeddings, chunk_metadata)
+    index.save(str(INDEX_DIR))
+    _done(f"{index.size} vectors indexed")
+
+    # ---- Step 7: Retrieve + answer ----
+    _step(7, total_steps, "Retrieving context and generating answer")
+    if use_metadata:
+        from src.retrieval.metadata_filter import (
+            MetadataStore, StagedRetriever, QueryMetadataParser,
+        )
+        metadata_store = MetadataStore(index.metadata)
+        staged = StagedRetriever(
+            encoder=encoder, index=index,
+            metadata_store=metadata_store,
+            parser=QueryMetadataParser(),
+        )
+        raw_results, stats = staged.query(question, top_k=top_k)
+        retriever = Retriever(encoder=encoder, index=index)
+        results = retriever._wrap_results(raw_results)
+        context = retriever.format_context(results, max_chars=3000)
+        if stats.get("constraints_detected"):
+            _info(f"Metadata constraints: {stats['constraints_detected']}")
+            _info(f"Pre-filter: {stats['candidates_before_filter']} -> "
+                  f"{stats['candidates_after_filter']} candidates")
+    else:
+        retriever = Retriever(encoder=encoder, index=index)
+        results = retriever.query(question, top_k=top_k)
+        context = retriever.format_context(results, max_chars=3000)
+
+    if not results:
+        _warn("No relevant context found in the knowledge base.")
+        return
+    _done(f"{len(results)} chunks retrieved")
+
+    # Generate answer with LLM.
+    _info("Generating answer with LLM...")
+    llm_settings = SETTINGS.get("llm", {})
+    provider = llm_settings.get("provider", "ollama").lower()
+    llm = None
+    if provider == "openvino":
+        try:
+            from src.llm.openvino_llm import OVLLMClient
+            ov_settings = SETTINGS.get("openvino", {})
+            llm_model_dir = ov_settings.get("llm_model_dir", "")
+            device = ov_settings.get("device", "CPU")
+            if llm_model_dir and Path(llm_model_dir).exists():
+                llm = OVLLMClient(model_dir=llm_model_dir, device=device)
+                if not llm.is_available():
+                    llm = None
+        except ImportError:
+            pass
+    if llm is None:
+        from src.llm.ollama_client import OllamaClient
+        llm = OllamaClient()
+
+    if not llm.is_available():
+        _warn("No LLM available — showing retrieved context only.")
+        _info("For Ollama: ollama serve && ollama pull mistral")
+        print(f"\n{context}")
+    else:
+        answer = llm.generate(question=question, context=context)
+        _done("Answer generated")
+        print(f"\n  {_C.BOLD}{_C.WHITE}Q: {question}{_C.RESET}")
+        print(f"\n  {_C.GREEN}{answer}{_C.RESET}")
+        print(f"\n  {_C.DIM}Based on {len(results)} retrieved chunks.{_C.RESET}")
+
+    # ---- Summary ----
+    _summary_table([
+        ("Documents loaded",  str(len(raw_docs))),
+        ("OCR extractions",   str(ocr_count)),
+        ("Chunks created",    str(len(chunks))),
+        ("Vectors indexed",   str(index.size)),
+        ("Time elapsed",      _elapsed(t0)),
+    ])
+    print(f"  {_C.GREEN}{_C.BOLD}{SYM_CHECK} Path query complete{_C.RESET}\n")
+
+
+# ===================================================================
 # Argument parser
 # ===================================================================
 
@@ -1213,6 +1466,34 @@ def build_parser() -> argparse.ArgumentParser:
         "-v", "--verbose",
         action="store_true",
         help="Enable debug logging",
+    )
+
+    # Top-level arguments for local path query mode.
+    parser.add_argument(
+        "--path",
+        type=str,
+        default=None,
+        help="Path to a local file or directory to ingest and query",
+    )
+    parser.add_argument(
+        "--ask",
+        type=str,
+        default=None,
+        help="Question to answer after ingesting the path (requires --path)",
+    )
+    parser.add_argument(
+        "--metadata-filtering",
+        action="store_true",
+        dest="metadata_filtering",
+        default=False,
+        help="Enable metadata-aware staged retrieval (requires --path)",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=5,
+        dest="top_k",
+        help="Number of context chunks to retrieve (requires --path, default: 5)",
     )
 
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
@@ -1430,6 +1711,22 @@ def main() -> None:
     args = parser.parse_args()
 
     setup_logging(verbose=getattr(args, "verbose", False))
+
+    # --- Local path query mode (--path / --ask) ---
+    if getattr(args, "path", None):
+        try:
+            cmd_path_query(args)
+        except KeyboardInterrupt:
+            print(f"\n  {_C.YELLOW}Interrupted by user.{_C.RESET}")
+            sys.exit(130)
+        except Exception as exc:
+            if getattr(args, "verbose", False):
+                logging.error("Path query failed: %s", exc, exc_info=True)
+            else:
+                print(f"\n  {_C.RED}{SYM_CROSS} Error: {exc}{_C.RESET}")
+                print(f"  {_C.DIM}Run with --verbose for full traceback.{_C.RESET}")
+            sys.exit(1)
+        return
 
     if args.command is None:
         parser.print_help()
