@@ -30,10 +30,46 @@ Design notes
 
 import logging
 import os
+import json
+import hashlib
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 
 logger = logging.getLogger(__name__)
+
+class CacheManager:
+    """
+    Handles caching of processed documents, images, and videos to avoid
+    redundant OCR, transcription, and embedding extraction.
+    """
+    def __init__(self, cache_dir: str = "data/processed/cache"):
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def get_hash(self, file_path: str) -> str:
+        p = Path(file_path).resolve()
+        stat = p.stat()
+        seed = f"{str(p)}|{stat.st_size}|{stat.st_mtime}"
+        return hashlib.md5(seed.encode('utf-8')).hexdigest()
+
+    def get_cached(self, file_path: str) -> Optional[Dict]:
+        p = self.cache_dir / f"doc_{self.get_hash(file_path)}.json"
+        if p.exists():
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.warning(f"Failed to read cache {p}: {e}")
+        return None
+
+    def save_cache(self, file_path: str, data: Dict):
+        p = self.cache_dir / f"doc_{self.get_hash(file_path)}.json"
+        try:
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+        except Exception as e:
+            logger.warning(f"Failed to save cache {p}: {e}")
+
 
 
 # ---------------------------------------------------------------------------
@@ -354,6 +390,259 @@ _FILE_EXTRACTORS = {
 # Image extensions that should be routed to the OCR module.
 _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp"}
 
+# Video extensions — routed to the video ingestion pipeline.
+_VIDEO_EXTENSIONS = {".mp4", ".avi", ".mkv", ".mov", ".webm", ".flv", ".wmv"}
+
+
+def _process_video_file(video_path: str, settings: dict = None) -> Optional["RawDocument"]:
+    """
+    Process a single video file through the existing video pipeline and
+    return a ``RawDocument`` with the extracted text.
+
+    Pipeline:
+        1. FrameSampler — extract frames at configured interval
+        2. FrameOCR — run Tesseract on extracted frames
+        3. AudioExtractor — extract audio track to WAV
+        4. WhisperTranscriber — transcribe audio to text segments
+        5. VideoDocumentBuilder — merge OCR + transcript into VideoDocument
+        6. Convert VideoDocument.text → RawDocument
+
+    Falls back gracefully:
+        - If Whisper fails → OCR-only text
+        - If OCR finds nothing → transcript-only text
+        - If both fail → returns None
+        - Corrupted videos → logged and returns None
+    """
+    settings = settings or {}
+    video_settings = settings.get("video", {})
+    vp = Path(video_path)
+
+    if not vp.exists():
+        logger.error("Video file not found: %s", video_path)
+        return None
+
+    # Output directories for intermediate artifacts.
+    output_base = Path(video_settings.get("output_dir", "data/processed/videos"))
+    frames_dir = output_base / "frames"
+    audio_dir = output_base / "audio"
+
+    video_id = vp.stem
+    frame_interval = video_settings.get("frame_interval", 5)
+    enable_whisper = video_settings.get("enable_whisper", True)
+    enable_ocr = video_settings.get("enable_frame_ocr", True)
+    enable_captioning = video_settings.get("enable_frame_captioning", True)
+    caption_interval = video_settings.get("caption_interval", 5)
+    caption_model = video_settings.get("caption_model", "Salesforce/blip-image-captioning-base")
+    ocr_min_words = video_settings.get("ocr_min_words", 3)
+    whisper_model = video_settings.get("whisper_model_size", "small")
+    whisper_device = video_settings.get("whisper_device", "cpu")
+    chunk_interval = video_settings.get("chunk_interval", 30)
+
+    transcript_segments = []
+    ocr_results = []
+    frame_captions = []  # FrameCaption objects from BLIP
+    duration = 0.0
+
+    # ---- Step 1: Frame Sampling ----
+    try:
+        from src.video.frame_sampler import FrameSampler
+        sampler = FrameSampler(
+            output_dir=str(frames_dir),
+            interval_seconds=frame_interval,
+        )
+        frames = sampler.sample(str(vp), video_id=video_id)
+        duration = sampler.get_video_duration(str(vp))
+        logger.info("Sampled %d frames from %s (%.1fs)",
+                    len(frames), vp.name, duration)
+    except Exception as exc:
+        logger.error("Frame sampling failed for %s: %s", vp.name, exc)
+        return None  # Can't do anything without frames or audio
+
+    # ---- Step 2: Frame OCR ----
+    if enable_ocr and frames:
+        try:
+            from src.video.frame_ocr import FrameOCR
+            frame_ocr = FrameOCR(min_word_count=ocr_min_words)
+            ocr_results = frame_ocr.extract_batch(frames)
+            logger.info("OCR: %d/%d frames had text",
+                        len(ocr_results), len(frames))
+        except Exception as exc:
+            logger.warning("Frame OCR failed for %s: %s", vp.name, exc)
+
+    # ---- Step 2.5: Frame Captioning (BLIP VLM) ----
+    if enable_captioning and frames:
+        try:
+            from src.video.frame_captioner import FrameCaptioner
+            captioner = FrameCaptioner(
+                model_name=caption_model,
+                use_openvino=video_settings.get("caption_use_openvino", False),
+            )
+            frame_captions = captioner.caption_batch(
+                frames, interval=caption_interval,
+            )
+            logger.info("Captioned %d frames from %s",
+                        len(frame_captions), vp.name)
+        except ImportError as exc:
+            logger.warning(
+                "Frame captioning skipped (missing dependency: %s)", exc
+            )
+        except Exception as exc:
+            logger.warning("Frame captioning failed for %s: %s", vp.name, exc)
+
+    # ---- Step 3 & 4: Audio Extraction + Whisper Transcription ----
+    if enable_whisper:
+        try:
+            from src.video.audio_extractor import AudioExtractor
+            from src.video.transcription import WhisperTranscriber
+
+            extractor = AudioExtractor(output_dir=str(audio_dir))
+            wav_path = extractor.extract(str(vp))
+
+            if wav_path:
+                transcriber = WhisperTranscriber(
+                    model_size=whisper_model,
+                    device=whisper_device,
+                )
+                transcript_segments = transcriber.transcribe(wav_path)
+                logger.info("Transcribed %d segments from %s",
+                            len(transcript_segments), vp.name)
+            else:
+                logger.info("No audio track in %s — using OCR only", vp.name)
+        except ImportError as exc:
+            logger.warning(
+                "Whisper/moviepy not available (%s) — using OCR only", exc
+            )
+        except Exception as exc:
+            logger.warning(
+                "Transcription failed for %s: %s — using OCR only",
+                vp.name, exc,
+            )
+
+    # Build caption text from BLIP results (used in both paths below).
+    caption_text_parts = []
+    for fc in frame_captions:
+        caption_text_parts.append(
+            f"Frame at {fc.timestamp:.1f}s: {fc.caption}"
+        )
+    caption_text = "\n".join(caption_text_parts)
+
+    # Collect frame paths for CLIP visual search (used even when no text).
+    frame_paths = [f.frame_path for f in frames] if frames else []
+
+    # ---- Step 5: Build VideoDocument ----
+    has_any_text = transcript_segments or ocr_results or caption_text
+    if not has_any_text:
+        # No text was found, but we have frames that CLIP can process visually.
+        # Return a RawDocument with frame metadata so cmd_path_query can run
+        # CLIP retrieval on the frames. A placeholder text ensures the document
+        # passes through the chunking pipeline without crashing.
+        if frame_paths:
+            logger.info(
+                "No text from OCR/Whisper/captioning for %s — falling back to CLIP"
+                " visual search on %d frames",
+                vp.name, len(frame_paths),
+            )
+            return RawDocument(
+                doc_key=video_id,
+                source=str(vp),
+                text=f"[Visual video: {vp.name}]",  # minimal placeholder
+                metadata={
+                    "file_type": "video",
+                    "file_name": vp.name,
+                    "source_directory": str(vp.parent),
+                    "modality": "video",
+                    "duration": round(duration, 2),
+                    "frame_count": len(frame_paths),
+                    "ocr_frames_with_text": 0,
+                    "transcript_segments": 0,
+                    "caption_count": 0,
+                    "video_frame_paths": frame_paths,  # for CLIP retrieval
+                    "clip_only": True,  # signal: use CLIP, not text search
+                },
+            )
+        logger.warning(
+            "No text and no frames extracted from %s — skipping", vp.name
+        )
+        return None
+
+    try:
+        from src.video.video_document_builder import VideoDocumentBuilder
+        builder = VideoDocumentBuilder(
+            output_dir=str(output_base),
+            chunk_interval=chunk_interval,
+        )
+
+        # Combine caption text into a list of "caption strings" so we can
+        # use build_from_captions (which already stores captions as
+        # caption_text in VideoChunk).
+        all_captions = []
+        if caption_text:
+            all_captions = caption_text_parts  # one string per frame caption
+
+        if transcript_segments:
+            video_doc = builder.build(
+                video_id=video_id,
+                source=str(vp),
+                transcript_segments=transcript_segments,
+                ocr_results=ocr_results,
+                video_path=str(vp),
+                duration=duration,
+            )
+            # Append BLIP captions to the document text via an extra chunk.
+            if all_captions:
+                from src.video.video_document_builder import VideoChunk
+                video_doc.chunks.append(VideoChunk(
+                    timestamp_start=0.0,
+                    timestamp_end=round(duration, 2),
+                    caption_text="\n".join(all_captions),
+                    metadata={
+                        "chunk_type": "blip_captions",
+                        "caption_count": len(all_captions),
+                    },
+                ))
+        else:
+            # No transcript: use captions + OCR via build_from_captions
+            video_doc = builder.build_from_captions(
+                video_id=video_id,
+                source=str(vp),
+                captions=all_captions,
+                video_path=str(vp),
+                duration=duration,
+                ocr_results=ocr_results,
+            )
+
+        # Save the video document JSON for debugging/auditing.
+        builder.save(video_doc)
+    except Exception as exc:
+        logger.error("VideoDocumentBuilder failed for %s: %s", vp.name, exc)
+        return None
+
+    # ---- Step 6: Convert to RawDocument ----
+    text = video_doc.text
+    if not text.strip():
+        logger.warning("Video %s produced empty text after processing", vp.name)
+        return None
+
+    return RawDocument(
+        doc_key=video_id,
+        source=str(vp),
+        text=text,
+        metadata={
+            "file_type": "video",
+            "file_name": vp.name,
+            "source_directory": str(vp.parent),
+            "modality": "video",
+            "duration": round(duration, 2),
+            "frame_count": len(frame_paths),
+            "ocr_frames_with_text": len(ocr_results),
+            "transcript_segments": len(transcript_segments),
+            "caption_count": len(frame_captions),
+            "caption_interval": caption_interval,
+            "video_doc_id": video_doc.doc_id,
+            "video_frame_paths": frame_paths,  # for CLIP retrieval augmentation
+        },
+    )
+
 
 # ---------------------------------------------------------------------------
 # Per-dataset record handlers
@@ -599,6 +888,7 @@ class DatasetLoader:
         if not root.exists():
             raise FileNotFoundError(f"Directory not found: {root}")
 
+        cache_mgr = CacheManager()
         documents: List[RawDocument] = []
         for file_path in sorted(root.rglob("*")):
             if not file_path.is_file():
@@ -608,6 +898,25 @@ class DatasetLoader:
 
             ext = file_path.suffix.lower()
             rel = str(file_path.relative_to(root))
+
+            # 1) Check Cache first!
+            cached_data = cache_mgr.get_cached(str(file_path))
+            if cached_data is not None:
+                meta = cached_data.get("metadata", {})
+                meta["is_cached"] = True
+                meta["cached_chunks"] = cached_data.get("chunks", [])
+                meta["cached_clip_data"] = cached_data.get("clip_data", {})
+                
+                doc = RawDocument(
+                    doc_key=cached_data.get("doc_key", str(file_path)),
+                    source=cached_data.get("source", str(file_path)),
+                    text=cached_data.get("text", ""),
+                    image_path=cached_data.get("image_path"),
+                    metadata=meta
+                )
+                logger.info("Loaded cached document for: %s", file_path.name)
+                documents.append(doc)
+                continue
 
             # Supported text-bearing document formats.
             if ext in _FILE_EXTRACTORS:
@@ -650,6 +959,33 @@ class DatasetLoader:
                         "source_directory": str(root),
                     },
                 ))
+
+            # Video files -- process via video pipeline.
+            elif ext in _VIDEO_EXTENSIONS:
+                try:
+                    import yaml as _yaml
+                    _settings_path = Path(__file__).resolve().parent.parent.parent / "configs" / "settings.yaml"
+                    _settings = {}
+                    if _settings_path.exists():
+                        _settings = _yaml.safe_load(_settings_path.read_text()) or {}
+                except Exception:
+                    _settings = {}
+
+                # Force Whisper ON for --path mode regardless of settings.yaml,
+                # which may have enable_whisper=false for MSR-VTT caption mode.
+                if "video" not in _settings:
+                    _settings["video"] = {}
+                _settings["video"]["enable_whisper"] = True
+
+                logger.info("Processing video file: %s", file_path)
+                video_doc = _process_video_file(str(file_path), settings=_settings)
+                if video_doc is not None:
+                    documents.append(video_doc)
+                else:
+                    logger.warning(
+                        "Video processing returned no text for: %s", file_path
+                    )
+
             else:
                 logger.debug("Skipping unsupported file: %s", file_path)
 
@@ -685,6 +1021,24 @@ class DatasetLoader:
             return self.load_directory(str(p), max_records=max_records)
 
         # --- Single file ---
+        cache_mgr = CacheManager()
+        cached_data = cache_mgr.get_cached(str(p))
+        if cached_data is not None:
+            meta = cached_data.get("metadata", {})
+            meta["is_cached"] = True
+            meta["cached_chunks"] = cached_data.get("chunks", [])
+            meta["cached_clip_data"] = cached_data.get("clip_data", {})
+
+            doc = RawDocument(
+                doc_key=cached_data.get("doc_key", str(p)),
+                source=cached_data.get("source", str(p)),
+                text=cached_data.get("text", ""),
+                image_path=cached_data.get("image_path"),
+                metadata=meta
+            )
+            logger.info("Loaded cached document for: %s", p.name)
+            return [doc]
+
         ext = p.suffix.lower()
         if ext in _FILE_EXTRACTORS:
             try:
@@ -720,6 +1074,33 @@ class DatasetLoader:
                     "source_directory": str(p.parent),
                 },
             )]
+
+        # --- Video files ---
+        if ext in _VIDEO_EXTENSIONS:
+            try:
+                import yaml as _yaml
+                _settings_path = Path(__file__).resolve().parent.parent.parent / "configs" / "settings.yaml"
+                _settings = {}
+                if _settings_path.exists():
+                    _settings = _yaml.safe_load(_settings_path.read_text()) or {}
+            except Exception:
+                _settings = {}
+
+            # Force Whisper ON for --path mode regardless of settings.yaml,
+            # which may have enable_whisper=false for MSR-VTT caption mode.
+            if "video" not in _settings:
+                _settings["video"] = {}
+            _settings["video"]["enable_whisper"] = True  # force, not setdefault
+
+            logger.info("Processing video file: %s", p)
+            video_doc = _process_video_file(str(p), settings=_settings)
+            if video_doc is not None:
+                return [video_doc]
+
+            logger.warning(
+                "Video processing returned no text for: %s", p
+            )
+            return []
 
         logger.warning("Unsupported file type: %s", p)
         return []

@@ -47,10 +47,11 @@ datasets:
 
 # -- OCR ---------------------------------------------------------------------
 ocr:
-  engine: "tesseract"            # "tesseract" or "paddleocr"
+  engine: "tesseract"            # "tesseract" or "paddleocr"  (PaddleOCR is default;
+                                 # falls back to Tesseract automatically if unavailable)
   tesseract_lang: "eng"
   paddleocr_lang: "en"           # PaddleOCR language ("en", "ch", etc.)
-  paddleocr_use_openvino: false  # Use OpenVINO backend for PaddleOCR
+  paddleocr_use_openvino: true   # Use OpenVINO backend for PaddleOCR
   preprocess: true               # apply adaptive-threshold before OCR (Tesseract only)
   confidence_threshold: 40       # discard words below this confidence (0-100)
 
@@ -114,7 +115,7 @@ video:
   enable_whisper: false
 
   # Extract 1 frame every N seconds (for frame sampling + OCR).
-  frame_interval: 5
+  frame_interval: 2
 
   # Whisper model variant: "tiny", "base", "small", "medium", "large".
   whisper_model_size: "small"
@@ -131,6 +132,32 @@ video:
   # Duration of each temporal chunk in seconds (transcript + OCR merge window).
   chunk_interval: 30
 
+  # -- Frame Captioning (VLM / BLIP) --
+  # Generate natural-language descriptions for sampled frames using a
+  # Vision Language Model.  Dramatically improves video RAG quality for
+  # non-text videos (e.g. real-world footage, demos, presentations).
+  enable_frame_captioning: true
+
+  # Caption every Nth frame (1 = every frame, 5 = every 5th frame).
+  # Higher values reduce processing time; lower values increase detail.
+  caption_interval: 5
+
+  # HuggingFace model identifier for captioning.
+  caption_model: "Salesforce/blip-image-captioning-base"
+
+  # Use OpenVINO for BLIP inference (requires optimum-intel).
+  caption_use_openvino: false
+
   # Processed output directory (relative to project root).
   output_dir: "data/processed/videos"
+
+# -- CLIP Multimodal Retrieval -----------------------------------------------
+# CLIP embeds images and text into a shared vector space, enabling visual
+# queries such as "find slides with charts" even when OCR text is minimal.
+clip:
+  enabled: true
+  model_name: "openai/clip-vit-base-patch32"
+  dimension: 512
+  use_openvino: true              # Accelerate CLIP vision model with OpenVINO
+
 

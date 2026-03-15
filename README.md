@@ -45,10 +45,11 @@ The pipeline consists of modular stages:
     *   **Documents**: PDF/Image ingestion using OCR (Tesseract/PaddleOCR).
     *   **Videos**: MSR-VTT dataset processing (Caption-based or Transcript-based).
 2.  **Normalization Layer**: Converts all inputs into a unified `NormalizedDocument` schema.
-3.  **Embedding Layer**: Generates vector representations using `all-MiniLM-L6-v2` (OpenVINO optimized).
-4.  **Indexing Layer**: Stores vectors in a FAISS index for efficient similarity search.
+3.  **Embedding Layer**: Generates vector representations using `all-MiniLM-L6-v2` (OpenVINO optimized) and optionally CLIP (`clip-vit-base-patch32`) for multimodal image-text embeddings.
+4.  **Indexing Layer**: Stores vectors in FAISS indices for efficient similarity search (separate text and CLIP indices).
 5.  **Retrieval & Generation**:
     *   Retrieves relevant chunks based on query similarity.
+    *   Optionally fuses text and CLIP results for multimodal queries (e.g. "find slides with charts").
     *   Augments LLM prompt with context.
     *   Generates answers using local OpenVINO LLM.
 
@@ -113,7 +114,7 @@ The system is designed to handle diverse multimodal inputs:
 | Data Type | Supported Formats | Processing Method |
 | :--- | :--- | :--- |
 | **Documents** | `.pdf`, `.docx`, `.pptx`, `.txt` | Text extraction (pdfplumber / python-docx / python-pptx) |
-| **Images** | `.png`, `.jpg`, `.jpeg`, `.tiff`, `.bmp` | OCR (Tesseract) + Text Normalization |
+| **Images** | `.png`, `.jpg`, `.jpeg`, `.tiff`, `.bmp` | OCR (Tesseract / PaddleOCR with OpenVINO) + CLIP embeddings |
 | **Videos** | `.mp4`, `.avi`, `.mov`, `.mkv` | Frame Sampling + Audio Transcription (Whisper) + Caption Integration |
 | **Metadata** | `.json`, `.txt` | Structural parsing (e.g., MSR-VTT annotations) |
 
@@ -457,7 +458,8 @@ This project explicitly leverages OpenVINO for:
 
 1.  **Embeddings**: `sentence-transformers` models are exported to OpenVINO IR format for faster CPU inference.
 2.  **LLM Inference**: Supports `optimum-intel` to run LLMs directly on Intel CPU/GPU/NPU without external servers.
-3.  **OCR (Planned)**: PaddleOCR inference optimized via OpenVINO.
+3.  **OCR**: PaddleOCR inference accelerated via OpenVINO ONNX backend (default engine; Tesseract fallback).
+4.  **CLIP Vision**: CLIP image encoder optionally compiled to OpenVINO IR for accelerated multimodal embeddings.
 
 Device selection (`CPU`, `GPU`, `NPU`) is configurable in `settings.yaml`.
 
@@ -485,7 +487,7 @@ The ingestion pipeline supports the following document types out of the box:
 | **PDF** | `pdfplumber` | Full page text |
 | **DOCX** | `python-docx` | Headings, paragraphs, and tables (pipe-separated) |
 | **PPTX** | `python-pptx` | Slide-numbered output with titles, content text, and tables |
-| **Images** | Tesseract / PaddleOCR | OCR-extracted text |
+| **Images** | Tesseract / PaddleOCR (OpenVINO) | OCR-extracted text + CLIP multimodal embeddings |
 | **Videos** | Whisper + OpenCV | Captions, audio transcription, and frame OCR |
 | **TXT** | Built-in | Raw text |
 
@@ -530,12 +532,20 @@ Q2 | $1.4M
 You can ingest a local file or directory and ask a question in a single command.
 The system will automatically ingest, index, retrieve, and answer.
 
+Supports **documents** (PDF, DOCX, PPTX, TXT), **images** (PNG, JPG, etc.), and **videos** (MP4, AVI, MKV, MOV, WebM, FLV, WMV) — all in one command.
+
 ```bash
 # Query a directory of documents
 python cli.py --path ./documents --ask "What is the payment amount?"
 
 # Query a single file
 python cli.py --path ./report.pdf --ask "Summarize this document"
+
+# Query a video file — automatically extracts frames, runs OCR, transcribes audio
+python cli.py --path video.mp4 --ask "What is the main topic of this video?"
+
+# Query a mixed folder (docs + images + videos)
+python cli.py --path ./mixed_folder --ask "Find mentions of invoices"
 
 # With metadata-aware filtering
 python cli.py --path ./docs --ask "Find invoices from 2019" --metadata-filtering
@@ -544,15 +554,26 @@ python cli.py --path ./docs --ask "Find invoices from 2019" --metadata-filtering
 python cli.py --path ./docs --ask "Key findings" --top-k 10
 ```
 
+For video files, the pipeline automatically:
+- Extracts frames at 5-second intervals using OpenCV
+- Runs Tesseract OCR on frames to capture on-screen text
+- Generates BLIP captions for every Nth frame (natural-language scene descriptions)
+- Extracts audio and transcribes it with Whisper
+- Merges OCR + captions + transcript into a unified text representation
+- CLIP visual search augments retrieval for non-text frames
+- Falls back gracefully: if one component fails, the others continue
+
 The pipeline executes:
 
-1. **Load** — Detect file types and extract text (PDF, DOCX, PPTX, TXT, images)
-2. **OCR** — Run Tesseract/PaddleOCR on image files
-3. **Normalise** — Clean text, detect language, deduplicate
-4. **Chunk** — Split text into 512-character passages with overlap
-5. **Embed** — Generate dense embeddings (PyTorch or OpenVINO)
-6. **Index** — Build FAISS vector index
-7. **Retrieve + Answer** — Semantic search + LLM-generated answer
+1. **Load** — Detect file types and extract text (PDF, DOCX, PPTX, TXT, images, videos)
+2. **Video Processing** — For video files: frame sampling → OCR → BLIP captioning → Whisper transcription
+3. **OCR** — Run Tesseract/PaddleOCR on image files
+4. **Normalise** — Clean text, detect language, deduplicate
+5. **Chunk** — Split text into 512-character passages with overlap
+6. **Embed** — Generate dense embeddings (PyTorch or OpenVINO)
+7. **CLIP** — Generate CLIP image embeddings for visual retrieval (when enabled)
+8. **Index** — Build FAISS vector index
+9. **Retrieve + Answer** — Semantic search (+ multimodal CLIP fusion with `--multimodal`) + LLM-generated answer
 
 ## AI Usage Disclosure
 

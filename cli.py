@@ -412,15 +412,84 @@ def cmd_ingest(args: argparse.Namespace) -> None:
     index.save(str(INDEX_DIR))
     _done(f"{index.size} vectors indexed")
 
+    # --- Step 7 (optional): CLIP image embeddings ---
+    # This is an ADDITIVE step — it creates a separate CLIP FAISS index
+    # alongside the existing text index.  The text index is unchanged.
+    clip_count = 0
+    clip_settings = SETTINGS.get("clip", {})
+    if clip_settings.get("enabled", False):
+        try:
+            from src.embeddings.clip_encoder import CLIPEncoder
+            from src.index.faiss_index import FaissIndex as CLIPFaissIndex
+
+            _step(7, 7, "Generating CLIP image embeddings")
+
+            clip_use_ov = clip_settings.get("use_openvino", False)
+            clip_model = clip_settings.get("model_name", "openai/clip-vit-base-patch32")
+            clip_dim = clip_settings.get("dimension", 512)
+
+            clip_encoder = CLIPEncoder(
+                model_name=clip_model,
+                use_openvino=clip_use_ov,
+            )
+
+            if clip_encoder.is_available:
+                # Collect documents with image paths
+                image_docs = [
+                    d for d in norm_docs
+                    if d.image_path and Path(d.image_path).exists()
+                ]
+
+                if image_docs:
+                    clip_embeddings_list = []
+                    clip_metadata_list = []
+
+                    for doc in image_docs:
+                        emb = clip_encoder.encode_image(doc.image_path)
+                        if emb is not None:
+                            clip_embeddings_list.append(emb)
+                            clip_metadata_list.append({
+                                "doc_id": doc.doc_id,
+                                "chunk_id": f"{doc.doc_id}_clip",
+                                "text": doc.text[:200] if doc.text else "",
+                                "image_path": doc.image_path,
+                                "modality": "image",
+                                "embedding_type": "clip",
+                                "metadata": doc.metadata,
+                            })
+                            clip_count += 1
+
+                    if clip_embeddings_list:
+                        import numpy as _clip_np
+                        clip_emb_array = _clip_np.stack(clip_embeddings_list)
+                        clip_index = CLIPFaissIndex(dimension=clip_dim)
+                        clip_index.build(clip_emb_array, clip_metadata_list)
+                        clip_index.save(str(INDEX_DIR / "clip"))
+                        _done(f"{clip_count} CLIP image embeddings indexed")
+                    else:
+                        _info("No images could be encoded with CLIP")
+                else:
+                    _info("No image documents found for CLIP embedding")
+            else:
+                _warn("CLIP encoder not available — skipping image embeddings")
+                _info("Install: pip install transformers torch Pillow")
+        except ImportError as e:
+            _info(f"CLIP embedding skipped — {e}")
+        except Exception as e:
+            _warn(f"CLIP embedding step failed: {e}")
+
     # --- Summary ---
-    _summary_table([
+    summary_rows = [
         ("Documents loaded",  str(len(raw_docs))),
         ("OCR extractions",   str(ocr_count)),
         ("With text",         str(len(docs_with_text))),
         ("Chunks created",    str(len(chunks))),
         ("Vectors indexed",   str(index.size)),
-        ("Time elapsed",      _elapsed(t0)),
-    ])
+    ]
+    if clip_count:
+        summary_rows.append(("CLIP images", str(clip_count)))
+    summary_rows.append(("Time elapsed", _elapsed(t0)))
+    _summary_table(summary_rows)
     print(f"  {_C.GREEN}{_C.BOLD}{SYM_CHECK} Ingestion complete{_C.RESET}\n")
 
 
@@ -496,6 +565,36 @@ def cmd_search(args: argparse.Namespace) -> None:
         _warn("No results found.")
         return
 
+    # --- Optional: Multimodal CLIP retrieval (additive) ---
+    use_multimodal = getattr(args, "multimodal", False)
+    if use_multimodal:
+        try:
+            from src.embeddings.clip_encoder import CLIPEncoder
+            from src.index.faiss_index import FaissIndex as CLIPFaissIndex
+            from src.retrieval.multimodal_retriever import MultimodalRetriever
+
+            clip_settings = SETTINGS.get("clip", {})
+            clip_index_path = INDEX_DIR / "clip"
+            if clip_index_path.exists() and clip_settings.get("enabled", False):
+                clip_enc = CLIPEncoder(
+                    model_name=clip_settings.get("model_name", "openai/clip-vit-base-patch32"),
+                    use_openvino=clip_settings.get("use_openvino", False),
+                )
+                if clip_enc.is_available:
+                    clip_idx = CLIPFaissIndex()
+                    clip_idx.load(str(clip_index_path))
+                    mm = MultimodalRetriever(
+                        text_encoder=encoder, text_index=index,
+                        clip_encoder=clip_enc, clip_index=clip_idx,
+                    )
+                    mm_results = mm.query(query, top_k=top_k)
+                    # Wrap multimodal results into RetrieverResult for display
+                    retriever_temp = Retriever(encoder=encoder, index=index)
+                    results = retriever_temp._wrap_results(mm_results)
+                    _info("Multimodal CLIP retrieval active")
+        except Exception as mm_exc:
+            _info(f"Multimodal retrieval not available: {mm_exc}")
+
     print()
     for i, r in enumerate(results, 1):
         score_color = _C.GREEN if r.score >= 0.5 else (_C.YELLOW if r.score >= 0.3 else _C.RED)
@@ -509,6 +608,8 @@ def cmd_search(args: argparse.Namespace) -> None:
     _info(f"Showing {len(results)} result(s) for top_k={top_k}")
     if use_metadata:
         _info("Mode: metadata-aware staged retrieval")
+    if use_multimodal:
+        _info("Mode: multimodal (text + CLIP)")
     print()
 
 
@@ -580,6 +681,35 @@ def cmd_ask(args: argparse.Namespace) -> None:
         retriever = Retriever(encoder=encoder, index=index)
         results = retriever.query(question, top_k=top_k)
         context = retriever.format_context(results, max_chars=3000)
+
+    # --- Optional: Multimodal CLIP retrieval (additive) ---
+    use_multimodal = getattr(args, "multimodal", False)
+    if use_multimodal:
+        try:
+            from src.embeddings.clip_encoder import CLIPEncoder
+            from src.index.faiss_index import FaissIndex as CLIPFaissIndex
+            from src.retrieval.multimodal_retriever import MultimodalRetriever
+
+            clip_settings = SETTINGS.get("clip", {})
+            clip_index_path = INDEX_DIR / "clip"
+            if clip_index_path.exists() and clip_settings.get("enabled", False):
+                clip_enc = CLIPEncoder(
+                    model_name=clip_settings.get("model_name", "openai/clip-vit-base-patch32"),
+                    use_openvino=clip_settings.get("use_openvino", False),
+                )
+                if clip_enc.is_available:
+                    clip_idx = CLIPFaissIndex()
+                    clip_idx.load(str(clip_index_path))
+                    mm = MultimodalRetriever(
+                        text_encoder=encoder, text_index=index,
+                        clip_encoder=clip_enc, clip_index=clip_idx,
+                    )
+                    mm_results = mm.query(question, top_k=top_k)
+                    results = retriever._wrap_results(mm_results)
+                    context = retriever.format_context(results, max_chars=3000)
+                    _info("Multimodal CLIP retrieval active")
+        except Exception as mm_exc:
+            _info(f"Multimodal retrieval not available: {mm_exc}")
 
     if not results:
         _warn("No relevant context found in the knowledge base.")
@@ -1258,7 +1388,11 @@ def cmd_path_query(args: argparse.Namespace) -> None:
         return
     _done(f"{len(raw_docs)} document(s) loaded")
 
-    # ---- Step 2: OCR for image documents ----
+    # ---- Step 1.5: Separate Cached from Uncached ----
+    cached_docs = [d for d in raw_docs if d.metadata.get("is_cached")]
+    uncached_docs = [d for d in raw_docs if not d.metadata.get("is_cached")]
+
+    # ---- Step 2: OCR for image documents (UNCACHED ONLY) ----
     _step(2, total_steps, "Running OCR on image documents")
     ocr_count = 0
     ocr_settings = SETTINGS.get("ocr", {})
@@ -1285,7 +1419,7 @@ def cmd_path_query(args: argparse.Namespace) -> None:
             )
         images_to_ocr = []
         image_doc_map = {}
-        for doc in raw_docs:
+        for doc in uncached_docs:
             if doc.image_path and not doc.text:
                 images_to_ocr.append(doc.image_path)
                 image_doc_map[doc.image_path] = doc
@@ -1301,24 +1435,103 @@ def cmd_path_query(args: argparse.Namespace) -> None:
     except ImportError as e:
         _warn(f"OCR skipped — {e}")
 
-    # ---- Step 3: Normalise ----
+    # ---- Step 3: Normalise (UNCACHED ONLY) ----
     _step(3, total_steps, "Normalising documents")
     normalizer = DocumentNormalizer(output_dir=str(NORMALISED_DIR))
-    norm_docs = normalizer.normalize(raw_docs)
+    norm_docs = normalizer.normalize(uncached_docs)
     normalizer.save(norm_docs)
-    _done(f"{len(norm_docs)} document(s) normalised")
+    _done(f"{len(norm_docs)} new document(s) normalised")
 
-    # ---- Step 4: Chunk ----
+    # ---- Step 4: Chunk (UNCACHED ONLY) ----
     _step(4, total_steps, "Chunking text into passages")
     chunker = TextChunker(chunk_size=512, overlap=64)
     docs_with_text = [d for d in norm_docs if d.text.strip()]
-    chunks = chunker.chunk_documents(docs_with_text)
-    if not chunks:
-        _warn("No text chunks produced — documents may lack extractable text.")
-        return
-    _done(f"{len(chunks)} chunks from {len(docs_with_text)} document(s)")
+    uncached_chunks = chunker.chunk_documents(docs_with_text)
+    
+    # Connect chunks to cached documents
+    from src.ingestion.chunker import TextChunk
+    all_chunks = list(uncached_chunks)
+    for doc in cached_docs:
+        c_list = doc.metadata.get("cached_chunks", [])
+        for c in c_list:
+            all_chunks.append(TextChunk(**c))
+            
+    if not all_chunks:
+        _warn("No text chunks produced — documents may lack extractable text. Continuing for visual search.")
+    else:
+        _done(f"{len(all_chunks)} total chunks combined (new and cached)")
 
-    # ---- Step 5: Embed ----
+    # ---- Step 4.5: Precompute CLIP + Save to Cache (UNCACHED ONLY) ----
+    _info("Precomputing CLIP embeddings and saving to cache...")
+    uncached_clip_data = {}
+    doc_id_to_chunks = {}
+    for c in uncached_chunks:
+        doc_id_to_chunks.setdefault(c.doc_id, []).append(c.to_dict())
+
+    # Only load CLIPEncoder if we actually need it for new images/frames
+    clip_enc = None
+    from src.ingestion.loader import CacheManager
+    cache_mgr = CacheManager()
+
+    source_to_ndoc = {nd.source: nd for nd in norm_docs}
+    for raw_doc in uncached_docs:
+        n_doc = source_to_ndoc.get(raw_doc.source)
+        ndoc_text = n_doc.text if n_doc else ""
+        ndoc_doc_id = n_doc.doc_id if n_doc else raw_doc.doc_key
+
+        fps = list(raw_doc.metadata.get("video_frame_paths", []))
+        if raw_doc.image_path:
+            fps.append(raw_doc.image_path)
+
+        emb_list = []
+        valid_fps = []
+        if fps:
+            if clip_enc is None:
+                from src.embeddings.clip_encoder import CLIPEncoder
+                clip_settings = SETTINGS.get("clip", {})
+                use_ov_clip = clip_settings.get("use_openvino", False)
+                clip_enc = CLIPEncoder(device='cpu', use_openvino=use_ov_clip)
+
+            unique_fps = list(set(fps))
+            _info(f"  Encoding {len(unique_fps)} frame(s) with CLIP for {Path(raw_doc.source).name}...")
+            try:
+                from tqdm import tqdm as _tqdm
+                fp_iter = _tqdm(unique_fps, desc="  CLIP frames", unit="frame", leave=False)
+            except ImportError:
+                fp_iter = unique_fps
+
+            for fp in fp_iter:
+                if Path(fp).exists():
+                    emb = clip_enc.encode_image(fp)
+                    if emb is not None:
+                        emb_list.append(emb.tolist())
+                        valid_fps.append(fp)
+
+        clip_data = {
+            "image_paths": valid_fps,
+            "embeddings": emb_list,
+            "frame_indices": list(range(len(valid_fps)))
+        }
+        uncached_clip_data[raw_doc.source] = clip_data
+
+        # Ensure metadata is serializable
+        safe_meta = {k: v for k, v in raw_doc.metadata.items()
+                     if k not in ["cached_chunks", "cached_clip_data", "is_cached"]}
+
+        cache_data = {
+            "doc_key": raw_doc.doc_key,
+            "source": raw_doc.source,
+            "text": ndoc_text,
+            "image_path": raw_doc.image_path,
+            "metadata": safe_meta,
+            "chunks": doc_id_to_chunks.get(ndoc_doc_id, []),
+            "clip_data": clip_data
+        }
+        cache_mgr.save_cache(raw_doc.source, cache_data)
+        if valid_fps or ndoc_text:
+            _done(f"  Cached {Path(raw_doc.source).name} ({len(valid_fps)} CLIP frames, {len(doc_id_to_chunks.get(ndoc_doc_id, []))} chunks)")
+
+    # ---- Step 5: Embed Text Chunks ----
     _step(5, total_steps, "Generating embeddings")
     encoder = None
     try:
@@ -1335,77 +1548,155 @@ def cmd_path_query(args: argparse.Namespace) -> None:
     if encoder is None:
         encoder = EmbeddingEncoder(device="cpu")
 
-    chunk_texts = [c.text for c in chunks]
-    embeddings = encoder.encode(chunk_texts, batch_size=64, show_progress=True)
-    EMBEDDINGS_DIR.mkdir(parents=True, exist_ok=True)
-    import numpy as _np
-    _np.save(str(EMBEDDINGS_DIR / "chunk_embeddings.npy"), embeddings)
-    _done(f"Shape {embeddings.shape}  ({embeddings.dtype})")
+    if all_chunks:
+        chunk_texts = [c.text for c in all_chunks]
+        embeddings = encoder.encode(chunk_texts, batch_size=64, show_progress=True)
+        EMBEDDINGS_DIR.mkdir(parents=True, exist_ok=True)
+        import numpy as _np
+        _np.save(str(EMBEDDINGS_DIR / "chunk_embeddings.npy"), embeddings)
+        _done(f"Shape {embeddings.shape}  ({embeddings.dtype})")
 
     # ---- Step 6: Build FAISS index ----
     _step(6, total_steps, "Building FAISS index")
-    chunk_metadata = [c.to_dict() for c in chunks]
+    index = None
+    if all_chunks:
+        chunk_metadata = [c.to_dict() for c in all_chunks]
 
-    # Enrich chunk metadata for metadata-aware retrieval.
-    try:
-        from src.retrieval.metadata_filter import enrich_chunk_metadata
-        for cm in chunk_metadata:
-            meta = cm.get("metadata", {})
-            doc_id = cm.get("doc_id", "")
-            file_type = meta.get("file_type", "")
-            modality = meta.get("modality", "")
+        # Enrich chunk metadata for metadata-aware retrieval.
+        try:
+            from src.retrieval.metadata_filter import enrich_chunk_metadata
+            for cm in chunk_metadata:
+                meta = cm.get("metadata", {})
+                doc_id = cm.get("doc_id", "")
+                file_type = meta.get("file_type", "")
+                modality = meta.get("modality", "")
+    
+                # Infer modality from file_type when not explicitly set.
+                if not modality:
+                    if file_type in (".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp"):
+                        modality = "image"
+                    elif file_type == "video":
+                        modality = "video"
+                    else:
+                        modality = "text"
+    
+                enrich_chunk_metadata(
+                    cm,
+                    file_name=meta.get("file_name", doc_id),
+                    file_type=file_type,
+                    source_directory=meta.get("source_directory", ""),
+                    modality=modality,
+                )
+        except ImportError:
+            pass
 
-            # Infer modality from file_type when not explicitly set.
-            if not modality:
-                if file_type in (".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp"):
-                    modality = "image"
-                else:
-                    modality = "text"
-
-            enrich_chunk_metadata(
-                cm,
-                file_name=meta.get("file_name", doc_id),
-                file_type=file_type,
-                source_directory=meta.get("source_directory", ""),
-                modality=modality,
-            )
-    except ImportError:
-        pass
-
-    index = FaissIndex(dimension=encoder.dimension)
-    index.build(embeddings, chunk_metadata)
-    index.save(str(INDEX_DIR))
-    _done(f"{index.size} vectors indexed")
+        index = FaissIndex(dimension=encoder.dimension)
+        index.build(embeddings, chunk_metadata)
+        index.save(str(INDEX_DIR))
+        _done(f"{index.size} vectors indexed")
 
     # ---- Step 7: Retrieve + answer ----
     _step(7, total_steps, "Retrieving context and generating answer")
-    if use_metadata:
-        from src.retrieval.metadata_filter import (
-            MetadataStore, StagedRetriever, QueryMetadataParser,
-        )
-        metadata_store = MetadataStore(index.metadata)
-        staged = StagedRetriever(
-            encoder=encoder, index=index,
-            metadata_store=metadata_store,
-            parser=QueryMetadataParser(),
-        )
-        raw_results, stats = staged.query(question, top_k=top_k)
-        retriever = Retriever(encoder=encoder, index=index)
-        results = retriever._wrap_results(raw_results)
-        context = retriever.format_context(results, max_chars=3000)
-        if stats.get("constraints_detected"):
-            _info(f"Metadata constraints: {stats['constraints_detected']}")
-            _info(f"Pre-filter: {stats['candidates_before_filter']} -> "
-                  f"{stats['candidates_after_filter']} candidates")
-    else:
-        retriever = Retriever(encoder=encoder, index=index)
-        results = retriever.query(question, top_k=top_k)
-        context = retriever.format_context(results, max_chars=3000)
+    context = ""
+    results = []
+    if all_chunks and index is not None:
+        if use_metadata:
+            from src.retrieval.metadata_filter import (
+                MetadataStore, StagedRetriever, QueryMetadataParser,
+            )
+            metadata_store = MetadataStore(index.metadata)
+            staged = StagedRetriever(
+                encoder=encoder, index=index,
+                metadata_store=metadata_store,
+                parser=QueryMetadataParser(),
+            )
+            raw_results, stats = staged.query(question, top_k=top_k)
+            retriever = Retriever(encoder=encoder, index=index)
+            results = retriever._wrap_results(raw_results)
+            context = retriever.format_context(results, max_chars=3000)
+            if stats.get("constraints_detected"):
+                _info(f"Metadata constraints: {stats['constraints_detected']}")
+                _info(f"Pre-filter: {stats['candidates_before_filter']} -> "
+                      f"{stats['candidates_after_filter']} candidates")
+        else:
+            retriever = Retriever(encoder=encoder, index=index)
+            results = retriever.query(question, top_k=top_k)
+            context = retriever.format_context(results, max_chars=3000)
 
-    if not results:
-        _warn("No relevant context found in the knowledge base.")
-        return
-    _done(f"{len(results)} chunks retrieved")
+        if not results:
+            _warn("No relevant text context found in the knowledge base.")
+        else:
+            _done(f"{len(results)} chunks retrieved")
+
+    # ---- CLIP visual frame search (using cached & precomputed) ----
+    all_clip_paths = []
+    all_clip_embs = []
+    
+    # 1. Gather precomputed CLIP data
+    for raw_doc in uncached_docs:
+        cd = uncached_clip_data.get(raw_doc.source, {})
+        all_clip_paths.extend(cd.get("image_paths", []))
+        all_clip_embs.extend(cd.get("embeddings", []))
+        
+    for raw_doc in cached_docs:
+        cd = raw_doc.metadata.get("cached_clip_data", {})
+        all_clip_paths.extend(cd.get("image_paths", []))
+        all_clip_embs.extend(cd.get("embeddings", []))
+
+    clip_visual_context = ""
+    if all_clip_paths and all_clip_embs:
+        _info(f"Running CLIP visual search on {len(all_clip_paths)} visual frames...")
+        try:
+            from src.index.faiss_index import FaissIndex as _FaissIndex
+            import numpy as _np
+
+            # Reuse clip_enc from step 4.5 if already loaded, else create new
+            if clip_enc is None:
+                from src.embeddings.clip_encoder import CLIPEncoder
+                clip_settings = SETTINGS.get("clip", {})
+                use_ov_clip = clip_settings.get("use_openvino", False)
+                clip_enc = CLIPEncoder(device='cpu', use_openvino=use_ov_clip)
+
+            frame_matrix = _np.array(all_clip_embs).astype("float32")
+
+            # Build a small in-memory FAISS index over frame embeddings.
+            clip_index = _FaissIndex(dimension=clip_enc.dimension)
+            clip_meta = [
+                {"text": f"[Visual frame: {Path(fp).name}]",
+                 "source": fp,
+                 "doc_id": Path(fp).stem,
+                 "metadata": {"file_type": "visual_frame", "frame_path": fp}}
+                for fp in all_clip_paths
+            ]
+            clip_index.build(frame_matrix, clip_meta)
+
+            # Encode the question text with CLIP text encoder.
+            query_clip_emb = clip_enc.encode_text(question)
+            if query_clip_emb is not None:
+                q_vec = query_clip_emb.reshape(1, -1).astype("float32")
+                clip_scores, clip_indices = clip_index.index.search(
+                    q_vec, min(top_k, len(all_clip_paths))
+                )
+                # Build a visual context block from CLIP-matched frames.
+                visual_parts = []
+                for score, idx in zip(clip_scores[0], clip_indices[0]):
+                    if idx < 0:
+                        continue
+                    fp = all_clip_paths[idx]
+                    visual_parts.append(
+                        f"[Frame: {Path(fp).name}  |  visual similarity: {score:.3f}]"
+                    )
+                if visual_parts:
+                    clip_visual_context = (
+                        "\n\n[Visual Context — CLIP matched frames from video/images]\n"
+                        + "\n".join(visual_parts)
+                    )
+                    _done(f"CLIP matched {len(visual_parts)} visually relevant frames")
+        except Exception as _clip_exc:
+            _warn(f"CLIP visual search skipped: {_clip_exc}")
+
+    # Merge text retrieval context + CLIP visual context.
+    full_context = context + clip_visual_context if clip_visual_context else context
 
     # Generate answer with LLM.
     _info("Generating answer with LLM...")
@@ -1431,20 +1722,22 @@ def cmd_path_query(args: argparse.Namespace) -> None:
     if not llm.is_available():
         _warn("No LLM available — showing retrieved context only.")
         _info("For Ollama: ollama serve && ollama pull mistral")
-        print(f"\n{context}")
+        print(f"\n{full_context}")
     else:
-        answer = llm.generate(question=question, context=context)
+        answer = llm.generate(question=question, context=full_context)
         _done("Answer generated")
         print(f"\n  {_C.BOLD}{_C.WHITE}Q: {question}{_C.RESET}")
         print(f"\n  {_C.GREEN}{answer}{_C.RESET}")
-        print(f"\n  {_C.DIM}Based on {len(results)} retrieved chunks.{_C.RESET}")
+        extra = " + CLIP visual frames" if clip_visual_context else ""
+        print(f"\n  {_C.DIM}Based on {len(results)} retrieved chunks{extra}.{_C.RESET}")
 
     # ---- Summary ----
     _summary_table([
         ("Documents loaded",  str(len(raw_docs))),
         ("OCR extractions",   str(ocr_count)),
-        ("Chunks created",    str(len(chunks))),
-        ("Vectors indexed",   str(index.size)),
+        ("Chunks created",    str(len(all_chunks))),
+        ("Vectors indexed",   str(index.size) if index is not None else "—"),
+        ("CLIP frames",       str(len(all_clip_paths)) if all_clip_paths else "—"),
         ("Time elapsed",      _elapsed(t0)),
     ])
     print(f"  {_C.GREEN}{_C.BOLD}{SYM_CHECK} Path query complete{_C.RESET}\n")
@@ -1553,6 +1846,11 @@ def build_parser() -> argparse.ArgumentParser:
         dest="metadata_filtering",
         help="Enable metadata-aware staged retrieval (pre-filter by year/type/directory)",
     )
+    p_search.add_argument(
+        "--multimodal",
+        action="store_true",
+        help="Enable multimodal retrieval (text + CLIP image embeddings)",
+    )
     p_search.set_defaults(func=cmd_search)
 
     # -- ask --
@@ -1583,6 +1881,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         dest="metadata_filtering",
         help="Enable metadata-aware staged retrieval (pre-filter by year/type/directory)",
+    )
+    p_ask.add_argument(
+        "--multimodal",
+        action="store_true",
+        help="Enable multimodal retrieval (text + CLIP image embeddings)",
     )
     p_ask.set_defaults(func=cmd_ask)
 

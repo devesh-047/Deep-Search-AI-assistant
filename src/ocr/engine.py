@@ -160,21 +160,24 @@ class OCREngine:
 
     def _paddleocr_extract(self, image_path: Path) -> str:
         """
-        Placeholder for PaddleOCR backend.
+        PaddleOCR backend — delegates to PaddleOCREngine when available.
 
-        Learning TODO:
-          1. pip install paddleocr paddlepaddle
-          2. Initialize PaddleOCR(use_angle_cls=True, lang='en')
-          3. Run ocr on the image and concatenate detected text lines
-          4. Later: convert PaddleOCR models to OpenVINO IR format
-             and use openvino.runtime for inference.
+        Falls back to empty string if PaddleOCR is not installed.
         """
-        logger.warning(
-            "[PLACEHOLDER] PaddleOCR backend not yet implemented. "
-            "Returning empty string for %s",
-            image_path,
-        )
-        return ""
+        try:
+            from src.ocr.paddle_engine import PaddleOCREngine
+            engine = PaddleOCREngine(lang=self.lang)
+            return engine.extract_text(str(image_path))
+        except ImportError:
+            logger.warning(
+                "PaddleOCR is not installed. Returning empty string for %s. "
+                "Install with: pip install paddleocr paddlepaddle",
+                image_path,
+            )
+            return ""
+        except Exception as exc:
+            logger.error("PaddleOCR failed on %s: %s", image_path, exc)
+            return ""
 
 
 def preprocess_image(image_path: str) -> Optional[str]:

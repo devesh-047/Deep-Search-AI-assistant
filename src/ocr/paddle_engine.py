@@ -154,17 +154,31 @@ class PaddleOCREngine:
 
         # OpenVINO backend configuration
         if use_openvino:
-            # PaddleOCR supports OpenVINO backend natively via
-            # PaddlePaddle's inference config. We set the appropriate
-            # flags to enable it.
+            # Use DeviceManager for proper device validation and fallback.
+            # This ensures we pick a valid device string and gracefully
+            # degrade to CPU if the preferred device is unavailable.
             try:
                 import openvino  # noqa: F401
+                try:
+                    from src.openvino.device_manager import DeviceManager
+                    dm = DeviceManager()
+                    self.device = dm.select(device)
+                    logger.info(
+                        "OpenVINO device validated via DeviceManager: %s",
+                        self.device,
+                    )
+                except Exception as dm_exc:
+                    logger.debug(
+                        "DeviceManager unavailable (%s), using device=%s as-is",
+                        dm_exc, device,
+                    )
+
                 # PaddleOCR can use OpenVINO via paddle2onnx conversion
                 # The simplest approach: let PaddleOCR handle it
                 ocr_kwargs["use_onnx"] = True
                 logger.info(
                     "PaddleOCR initialised with OpenVINO-compatible "
-                    "ONNX backend on %s", device,
+                    "ONNX backend on %s", self.device,
                 )
             except ImportError:
                 logger.warning(

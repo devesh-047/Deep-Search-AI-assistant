@@ -72,7 +72,7 @@ class AudioExtractor:
             return str(wav_path)
 
         try:
-            from moviepy.editor import VideoFileClip
+            from moviepy import VideoFileClip
         except ImportError:
             logger.error(
                 "moviepy is not installed.  Install with: pip install moviepy"

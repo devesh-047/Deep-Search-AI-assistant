@@ -1,9 +1,9 @@
 """
-Video processing subpackage -- extracting, transcribing, and interpreting video content.
+Video processing subpackage -- extracting, transcribing, captioning, and interpreting video content.
 
 Supports two ingestion modes:
     - **Caption mode** (MSR-VTT): VideoLoader → FrameSampler → FrameOCR → VideoDocumentBuilder
-    - **Transcript mode**: VideoLoader → AudioExtractor → WhisperTranscriber → FrameSampler → FrameOCR → VideoDocumentBuilder
+    - **Transcript mode**: VideoLoader → AudioExtractor → WhisperTranscriber → FrameSampler → FrameOCR → FrameCaptioner → VideoDocumentBuilder
 """
 
 from src.video.video_loader import VideoLoader, VideoFile
@@ -15,5 +15,11 @@ from src.video.video_document_builder import VideoDocumentBuilder
 try:
     from src.video.audio_extractor import AudioExtractor
     from src.video.transcription import WhisperTranscriber
+except ImportError:
+    pass
+
+# BLIP frame captioner is optional (requires transformers + Pillow).
+try:
+    from src.video.frame_captioner import FrameCaptioner
 except ImportError:
     pass
