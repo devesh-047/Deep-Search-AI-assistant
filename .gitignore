@@ -2,12 +2,37 @@ venv/
 .venv/
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+*.egg-info/
 .env
+
+# Data outputs
 logs/
 data/processed/
-.DS_Store
+data/raw/
+
+# IDE
 .vscode/
 .idea/
+.DS_Store
+
+# Models & OpenVINO artifacts
 models/
+*.bin
+*.onnx
+*.blob
+*.npy
+
+# Note: *.xml is NOT ignored globally because it includes configs.
+# OpenVINO IR .xml files live under models/ which is already ignored.
+
+# Proposal & scratch
 proposal/
+proposal.log
+codebase_summary_ocr_vlm.md
+test.jpg
+test.tex
+test.aux
+test.log
 

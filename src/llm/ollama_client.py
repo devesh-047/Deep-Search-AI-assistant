@@ -117,6 +117,15 @@ Context:
 RAG_USER_TEMPLATE_CONCISE = """{question}"""
 
 
+# Template 4: Lean — minimal tokens, fastest to process.  Used as the
+# default for CLI streaming where lower latency matters more than
+# elaborate instruction framing.  Context + question in one block.
+RAG_PROMPT_LEAN = """Answer using context only:
+{context}
+Q: {question}
+A:"""
+
+
 # Template registry for easy switching
 PROMPT_TEMPLATES: Dict[str, Dict[str, str]] = {
     "default": {
@@ -133,6 +142,11 @@ PROMPT_TEMPLATES: Dict[str, Dict[str, str]] = {
         "system": RAG_SYSTEM_PROMPT_CONCISE,
         "user": RAG_USER_TEMPLATE_CONCISE,
         "description": "Short factual answers: dates, names, amounts",
+    },
+    "lean": {
+        "system": "",            # no separate system message
+        "user": RAG_PROMPT_LEAN, # combined context + Q/A block
+        "description": "Lean: minimal tokens, fastest for CLI streaming",
     },
 }
 
@@ -269,7 +283,7 @@ class OllamaClient:
     def build_rag_prompt(
         question: str,
         context: str,
-        template: str = "default",
+        template: str = "lean",
     ) -> Dict[str, str]:
         """
         Build the system and user messages for a RAG query.
@@ -282,13 +296,22 @@ class OllamaClient:
         Args:
             question : the user's question
             context  : formatted context from Retriever.format_context()
-            template : one of "default", "cited", "concise"
+            template : one of "default", "cited", "concise", "lean"
 
         Returns:
             Dict with "system" and "user" keys containing the
-            formatted prompt strings.
+            formatted prompt strings.  For the "lean" template the
+            entire prompt is in "user" and "system" is empty.
         """
-        tmpl = PROMPT_TEMPLATES.get(template, PROMPT_TEMPLATES["default"])
+        tmpl = PROMPT_TEMPLATES.get(template, PROMPT_TEMPLATES["lean"])
+        if template == "lean":
+            # Lean template embeds context directly in the combined prompt.
+            # If there is no context, fall back gracefully.
+            if context:
+                user_msg = tmpl["user"].format(context=context, question=question)
+            else:
+                user_msg = f"Q: {question}\nA:"
+            return {"system": "", "user": user_msg}
         system_msg = tmpl["system"].format(context=context) if context else ""
         user_msg = tmpl["user"].format(question=question)
         return {"system": system_msg, "user": user_msg}

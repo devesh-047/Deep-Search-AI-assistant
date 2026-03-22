@@ -763,11 +763,32 @@ def cmd_ask(args: argparse.Namespace) -> None:
         return
 
     _info("Thinking...")
-    answer = llm.generate(question=question, context=context)
-    _done("Answer generated")
 
-    print(f"\n  {_C.BOLD}{_C.WHITE}Q: {question}{_C.RESET}")
-    print(f"\n  {_C.GREEN}{answer}{_C.RESET}")
+    use_stream = not getattr(args, "no_stream", False)
+    template = getattr(args, "template", "lean")
+
+    if use_stream and hasattr(llm, "generate_stream"):
+        # Stream tokens progressively to the terminal.
+        print(f"\n  {_C.BOLD}{_C.WHITE}Q: {question}{_C.RESET}")
+        print(f"\n  {_C.GREEN}", end="", flush=True)
+        answer_chunks = []
+        try:
+            for chunk in llm.generate_stream(
+                question=question,
+                context=context,
+                template=template,
+            ):
+                print(chunk, end="", flush=True)
+                answer_chunks.append(chunk)
+        except KeyboardInterrupt:
+            pass  # allow Ctrl-C mid-stream without traceback
+        print(_C.RESET)  # end the colour
+    else:
+        answer = llm.generate(question=question, context=context, template=template)
+        _done("Answer generated")
+        print(f"\n  {_C.BOLD}{_C.WHITE}Q: {question}{_C.RESET}")
+        print(f"\n  {_C.GREEN}{answer}{_C.RESET}")
+
     print(f"\n  {_C.DIM}Based on {len(results)} retrieved chunks.{_C.RESET}\n")
 
 
@@ -1886,6 +1907,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--multimodal",
         action="store_true",
         help="Enable multimodal retrieval (text + CLIP image embeddings)",
+    )
+    p_ask.add_argument(
+        "--no-stream",
+        action="store_true",
+        dest="no_stream",
+        help="Disable streaming output; wait for full response before printing",
+    )
+    p_ask.add_argument(
+        "--template",
+        type=str,
+        default="lean",
+        choices=["lean", "default", "cited", "concise"],
+        help="Prompt template (default: lean — minimal tokens for fastest streaming)",
     )
     p_ask.set_defaults(func=cmd_ask)
 

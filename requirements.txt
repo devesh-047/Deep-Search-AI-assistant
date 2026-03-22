@@ -35,7 +35,7 @@ pillow                        # Image handling
 pytesseract                   # Tesseract OCR engine
 opencv-python                 # Image preprocessing for OCR
 
-# --- Language detection (optional but used in normalizer.py) ---
+# --- Language detection (used in normalizer.py) ---
 langdetect
 
 # --- Video ingestion ---
@@ -56,6 +56,7 @@ optimum-intel>=1.16.0         # provides: from optimum.intel import OVModelForCa
 nncf>=2.7.0                   # Neural Network Compression Framework
 
 # --- Optional: PaddleOCR (alternate OCR engine) ---
-# Uncomment if you want PaddleOCR support:
+# Set ocr.engine: "paddleocr" in configs/settings.yaml to enable.
+# Uncomment to install:
 # paddlepaddle
 # paddleocr>=2.7.0

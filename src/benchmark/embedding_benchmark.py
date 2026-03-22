@@ -144,7 +144,7 @@ def _run_openvino(
     except ImportError as exc:
         return {"error": f"OVEmbeddingEncoder not importable: {exc}"}
 
-    # --- Load model (nt timed as part of inference) ---
+    # --- Load model (not timed as part of inference) ---
     load_start = time.perf_counter()
     encoder = OVEmbeddingEncoder(model_xml=model_xml, device=device)
     if encoder._compiled_model is None:

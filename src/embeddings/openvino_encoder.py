@@ -137,9 +137,19 @@ class OVEmbeddingEncoder:
             2. Core.compile_model() — optimize the graph for the target
                device (operator fusion, memory planning, etc.) and
                prepare it for inference.
+
+        API note:
+            OpenVINO 2024+ moved Core to the top-level ``openvino``
+            package.  The old ``openvino.runtime.Core`` import was
+            removed in 2026.  We try the new API first and fall back
+            to the legacy path for older installs.
         """
         try:
-            from openvino.runtime import Core
+            # OV 2024+ API (openvino >= 2024.0)
+            try:
+                from openvino import Core
+            except ImportError:
+                from openvino.runtime import Core   # legacy OV < 2024
 
             xml_path = Path(model_xml)
             if not xml_path.exists():
@@ -384,7 +394,10 @@ def list_available_devices() -> List[str]:
     Useful for the ``cli.py devices`` command.
     """
     try:
-        from openvino.runtime import Core
+        try:
+            from openvino import Core          # OV 2024+
+        except ImportError:
+            from openvino.runtime import Core  # legacy
         return Core().available_devices
     except ImportError:
         logger.warning("openvino not installed -- cannot list devices")

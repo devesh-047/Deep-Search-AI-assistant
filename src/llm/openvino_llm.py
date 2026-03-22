@@ -56,6 +56,13 @@ RAG_USER_TEMPLATE = """Based on the context provided, please answer the followin
 
 {question}"""
 
+# Lean prompt — minimal tokens for lower latency.  Matches OllamaClient.
+# All context + question in one block; no separate system message needed.
+RAG_PROMPT_LEAN = """Answer using context only:
+{context}
+Q: {question}
+A:"""
+
 
 class OVLLMClient:
     """
@@ -188,7 +195,7 @@ class OVLLMClient:
     def build_rag_prompt(
         question: str,
         context: str,
-        template: str = "default",
+        template: str = "lean",
     ) -> Dict[str, str]:
         """
         Build RAG prompt messages.
@@ -199,11 +206,19 @@ class OVLLMClient:
         Args:
             question : the user's question
             context  : formatted context from Retriever
-            template : prompt template name (only "default" supported)
+            template : "default" or "lean" (default is "lean")
 
         Returns:
             Dict with "system" and "user" keys.
+            For "lean" the entire prompt is in "user"; "system" is empty.
         """
+        if template == "lean":
+            if context:
+                user_msg = RAG_PROMPT_LEAN.format(context=context, question=question)
+            else:
+                user_msg = f"Q: {question}\nA:"
+            return {"system": "", "user": user_msg}
+        # Default template
         system_msg = RAG_SYSTEM_PROMPT.format(context=context) if context else ""
         user_msg = RAG_USER_TEMPLATE.format(question=question)
         return {"system": system_msg, "user": user_msg}
@@ -379,6 +394,107 @@ class OVLLMClient:
         except Exception as exc:
             logger.error("OpenVINO optimum generation failed: %s", exc)
             return f"[ERROR] OpenVINO generation failed: {exc}"
+
+    # ------------------------------------------------------------------
+    # Streaming support
+    # ------------------------------------------------------------------
+
+    def generate_stream(
+        self,
+        question: str,
+        context: str = "",
+        temperature: float = 0.3,
+        top_p: float = 0.9,
+        max_tokens: int = 1024,
+        template: str = "lean",
+        preset: Optional[str] = None,
+    ):
+        """
+        Streaming generation — yields text chunks as they are produced.
+
+        For the **genai backend**: uses the ``openvino_genai`` streaming
+        callback if the installed version supports it; otherwise falls
+        back to yielding the full response as a single chunk.
+
+        For the **optimum backend**: generates the full response and
+        yields it as a single chunk (HuggingFace optimum does not
+        expose per-token streaming natively).
+
+        The interface matches ``OllamaClient.generate_stream()`` so
+        ``cmd_ask`` in ``cli.py`` can call both clients identically.
+
+        Yields:
+            str chunks (each is a partial response token / word).
+        """
+        prompt_parts = self.build_rag_prompt(question, context, template)
+        system_msg = prompt_parts["system"]
+        user_msg = prompt_parts["user"]
+
+        if system_msg:
+            full_prompt = f"[INST] {system_msg}\n\n{user_msg} [/INST]"
+        else:
+            full_prompt = f"[INST] {user_msg} [/INST]"
+
+        if not self.is_available():
+            yield (
+                "[OVLLMClient] Model not loaded.  "
+                "Run: optimum-cli export openvino --model mistralai/Mistral-7B-Instruct-v0.2 "
+                "--weight-format int4 models/ov/mistral-7b-instruct/"
+            )
+            return
+
+        # --- genai backend: try streamer callback ---
+        if self._backend == "genai":
+            try:
+                import openvino_genai
+
+                config = openvino_genai.GenerationConfig()
+                config.max_new_tokens = max_tokens
+                config.temperature = temperature
+                config.top_p = top_p
+                config.do_sample = temperature > 0
+
+                # Collect tokens via the streamer
+                tokens_collected: list = []
+
+                class _Streamer(openvino_genai.StreamerBase):
+                    def put(self, token_id: int) -> bool:
+                        # Decode the single token and store it
+                        word = self._pipe.get_tokenizer().decode([token_id])
+                        tokens_collected.append(word)
+                        return False  # False = continue generation
+
+                # openvino_genai version check: StreamerBase may not exist
+                # in older builds.  Fall back to full-response yield.
+                try:
+                    streamer = _Streamer()
+                    # streamer needs a reference to the pipeline tokenizer;
+                    # inject it if the class supports it
+                    if hasattr(streamer, '_pipe') is False:
+                        streamer._pipe = self._pipeline
+                    self._pipeline.generate(full_prompt, config, streamer)
+                    for tok in tokens_collected:
+                        yield tok
+                    return
+                except (AttributeError, TypeError):
+                    # Streamer API not available — yield full result as one chunk
+                    result = self._pipeline.generate(full_prompt, config)
+                    yield str(result).strip()
+                    return
+
+            except Exception as exc:
+                yield f"\n[ERROR] OpenVINO genai streaming failed: {exc}"
+                return
+
+        # --- optimum backend: generate in full, yield once ---
+        if self._backend == "optimum":
+            try:
+                result = self._generate_optimum(
+                    full_prompt, temperature, top_p, max_tokens
+                )
+                yield result
+            except Exception as exc:
+                yield f"\n[ERROR] OpenVINO optimum streaming failed: {exc}"
 
     def benchmark(
         self,

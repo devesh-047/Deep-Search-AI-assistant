@@ -1,11 +1,20 @@
 """
 OpenVINO Embeddings (Learning Placeholder)
 ============================================
+
+.. deprecated::
+    This file is a SUPERSEDED PLACEHOLDER kept for historical reference only.
+    The production-ready implementation is at:
+        src/embeddings/openvino_encoder.py  ← this is what cli.py uses
+
+    Do NOT import from this module in new code.
+
 This module defines the interface for running the embedding model
 (all-MiniLM-L6-v2) using OpenVINO Runtime instead of PyTorch.
 
-STATUS: PLACEHOLDER -- not yet functional.
-This file exists as a learning hook for Phase 9 of the roadmap.
+STATUS: SUPERSEDED — see src/embeddings/openvino_encoder.py for the
+full working implementation with mean-pooling, L2 normalisation, and
+batch inference support.
 
 Why OpenVINO for embeddings?
   - The sentence-transformers model runs on PyTorch by default.

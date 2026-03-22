@@ -1,11 +1,20 @@
 """
 OpenVINO LLM Inference (Learning Placeholder)
 ===============================================
+
+.. deprecated::
+    This file is a SUPERSEDED PLACEHOLDER kept for historical reference only.
+    The production-ready implementation is at:
+        src/llm/openvino_llm.py  ← this is what cli.py uses
+
+    Do NOT import from this module in new code.
+
 This module defines the interface for running a local LLM using
 OpenVINO GenAI instead of Ollama.
 
-STATUS: PLACEHOLDER -- not yet functional.
-This file exists as a learning hook for Phase 10 of the roadmap.
+STATUS: SUPERSEDED — see src/llm/openvino_llm.py for the full working
+implementation using openvino_genai.LLMPipeline (primary) and
+optimum.intel.OVModelForCausalLM (fallback), with streaming support.
 
 Why OpenVINO GenAI for LLM inference?
   - Ollama uses llama.cpp under the hood, which is already efficient,

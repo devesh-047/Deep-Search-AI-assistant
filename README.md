@@ -276,10 +276,13 @@ No code changes required.
 
 Settings are managed in `configs/settings.yaml`. Key sections:
 
-*   `llm`: Select model provider (OpenVINO vs Ollama).
-*   `vector_db`: FAISS index settings.
+*   `llm`: Select model provider (OpenVINO vs Ollama) and model name.
+*   `openvino`: OpenVINO device, embedding IR path, and LLM model directory.
+*   `ocr`: OCR engine selection (`tesseract` or `paddleocr`) and preprocessing options.
+*   `faiss`: FAISS index type settings (`IndexFlatIP` is default).
 *   `video`: MSR-VTT dataset path and processing mode.
     *   `enable_whisper`: Set to `false` for caption mode (faster), `true` for transcripts.
+*   `clip`: CLIP multimodal retrieval settings (enable/disable, model name, OpenVINO flag).
 
 ## How to Run
 
