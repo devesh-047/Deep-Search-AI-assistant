@@ -134,28 +134,55 @@ def _run_openvino(
     """
     Benchmark the OpenVINO IR encoder.
 
-    Returns a result dict with timing and system metrics.
+    Measures both cold-start load time (compile from IR, no cached blob) and
+    warm-start load time (load pre-compiled blob from ~/.deepsearch/cache/).
+    Reports both values so the cache speedup is immediately visible.
     """
     if not Path(model_xml).exists():
         return {"error": f"OpenVINO IR model not found: {model_xml}"}
 
     try:
-        from src.embeddings.openvino_encoder import OVEmbeddingEncoder
+        from src.embeddings.openvino_encoder import OVEmbeddingEncoder, _CACHE_DIR, _get_cache_key
     except ImportError as exc:
         return {"error": f"OVEmbeddingEncoder not importable: {exc}"}
 
-    # --- Load model (not timed as part of inference) ---
-    load_start = time.perf_counter()
-    encoder = OVEmbeddingEncoder(model_xml=model_xml, device=device)
-    if encoder._compiled_model is None:
-        return {"error": "OpenVINO model failed to compile. Check model_xml path."}
-    load_time_s = time.perf_counter() - load_start
+    # ------------------------------------------------------------------
+    # Measure COLD load time (force recompile by removing cached blob)
+    # ------------------------------------------------------------------
+    cache_key  = _get_cache_key(str(Path(model_xml).resolve()), device)
+    cache_path = _CACHE_DIR / f"{cache_key}.blob"
 
-    # --- Warmup ---
+    # Remove blob so we always get a reproducible cold measurement
+    if cache_path.exists():
+        cache_path.unlink()
+
+    cold_start = time.perf_counter()
+    encoder_cold = OVEmbeddingEncoder(model_xml=model_xml, device=device)
+    cold_load_s = round(time.perf_counter() - cold_start, 3)
+
+    if encoder_cold._compiled_model is None:
+        return {"error": "OpenVINO model failed to compile. Check model_xml path."}
+
+    # ------------------------------------------------------------------
+    # Measure WARM load time (blob now exists from the cold run above)
+    # ------------------------------------------------------------------
+    warm_load_s = None
+    if cache_path.exists():
+        warm_start = time.perf_counter()
+        encoder_warm = OVEmbeddingEncoder(model_xml=model_xml, device=device)
+        warm_load_s = round(time.perf_counter() - warm_start, 3)
+        # Use the warm encoder for the inference benchmark
+        encoder = encoder_warm
+    else:
+        # export_model not supported on this OV version — use cold encoder
+        encoder = encoder_cold
+
+    # ------------------------------------------------------------------
+    # Inference benchmark (timed iterations, warmup excluded)
+    # ------------------------------------------------------------------
     for _ in range(n_warmup):
         encoder.encode(texts[:batch_size], batch_size=batch_size)
 
-    # --- Timed iterations ---
     latencies: List[float] = []
     with SystemMetricsSampler(interval=0.05) as metrics:
         for _ in range(n_iterations):
@@ -166,7 +193,7 @@ def _run_openvino(
     latencies_arr = np.array(latencies)
     n_texts = len(texts)
 
-    return {
+    result: Dict = {
         "backend": f"OpenVINO {device}",
         "model": model_xml,
         "device": device,
@@ -174,7 +201,10 @@ def _run_openvino(
         "batch_size": batch_size,
         "n_iterations": n_iterations,
         "n_warmup": n_warmup,
-        "load_time_s": round(load_time_s, 3),
+        "cold_load_s": cold_load_s,
+        "warm_load_s": warm_load_s,
+        # Keep load_time_s as the cold-start value for backward compatibility
+        "load_time_s": cold_load_s,
         "avg_latency_ms": round(float(latencies_arr.mean() * 1000), 2),
         "min_latency_ms": round(float(latencies_arr.min() * 1000), 2),
         "max_latency_ms": round(float(latencies_arr.max() * 1000), 2),
@@ -184,6 +214,11 @@ def _run_openvino(
         "peak_cpu_percent": round(metrics.peak_cpu_percent, 1),
         "peak_rss_mb": round(metrics.peak_rss_mb, 1),
     }
+
+    if warm_load_s is not None and warm_load_s > 0:
+        result["cache_speedup"] = round(cold_load_s / warm_load_s, 2)
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +286,37 @@ def run_embedding_benchmark(
     return output
 
 
+def run_cache_benchmark(
+    model_xml: str,
+    ov_device: str = "CPU",
+) -> Dict:
+    """
+    Run a minimal OpenVINO benchmark to report cold and warm load times.
+
+    Args:
+        model_xml : Path to OpenVINO IR .xml.
+        ov_device : OpenVINO device string (CPU, GPU, NPU).
+
+    Returns:
+        Dict with cold_load_s, warm_load_s, and cache_speedup.
+    """
+    # Use minimal parameters for inference as we only care about load times
+    results = _run_openvino(
+        texts=_build_corpus(1),
+        batch_size=1,
+        n_iterations=1,
+        n_warmup=0,
+        model_xml=model_xml,
+        device=ov_device,
+    )
+    return {
+        "cold_load_s": results.get("cold_load_s"),
+        "warm_load_s": results.get("warm_load_s"),
+        "cache_speedup": results.get("cache_speedup"),
+        "error": results.get("error"),
+    }
+
+
 def print_embedding_results(results: Dict) -> None:
     """Render benchmark results to stdout in a readable report format."""
     sep = "-" * 50
@@ -274,7 +340,19 @@ def print_embedding_results(results: Dict) -> None:
         if psutil_available():
             print(f"  Mean CPU     : {r['mean_cpu_percent']}%")
             print(f"  Peak RSS     : {r['peak_rss_mb']} MB")
-        print(f"  Model load   : {r['load_time_s']} s")
+
+        # Load time — show cold/warm breakdown for OV, plain value for PyTorch
+        cold = r.get("cold_load_s")
+        warm = r.get("warm_load_s")
+        if cold is not None and warm is not None:
+            cache_speedup = r.get("cache_speedup", "—")
+            print(f"  Model load   : {cold} s  (cold — compile from IR)")
+            print(f"  Cached load  : {warm} s  (warm — from blob)  [{cache_speedup}x faster]")
+        elif cold is not None:
+            print(f"  Model load   : {cold} s  (cold — blob export not supported)")
+        else:
+            load = r.get("load_time_s", "—")
+            print(f"  Model load   : {load} s")
 
     if pt:
         n_texts = pt.get("n_texts", "?")

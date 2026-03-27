@@ -369,6 +369,9 @@ python3 cli.py benchmark --llm
 
 # Custom batch size and iteration count
 python3 cli.py benchmark --embeddings --batch-size 32 --iterations 50 --warmup 5
+
+# End-to-end startup latency (Cold, Warm, Daemon modes)
+python3 cli.py benchmark --startup
 ```
 
 ### Benchmark Results (Measured on Project Hardware)
@@ -455,11 +458,58 @@ export and execution:
 These optimizations are transparent to application code: the encoder and
 LLM client interfaces are identical regardless of backend.
 
+### Compiled Model Caching
+
+The first time `OVEmbeddingEncoder` runs it compiles the IR model for the target
+device (graph fusion, memory planning, etc.). On subsequent runs the pre-compiled
+binary blob is loaded directly — skipping the `read_model + compile_model` step.
+
+| Run type | What happens |
+| :--- | :--- |
+| **Cold start** (no cache) | Reads `.xml`, compiles, saves `.blob` to cache |
+| **Warm start** (cached) | Loads `.blob` directly via `core.import_model()` |
+
+**Cache location**: `~/.deepsearch/cache/<md5_hash>.blob`
+
+The hash encodes both the model path and the device string, so blobs are
+never shared across devices or after the model file is replaced.
+
+**Typical speedup**: loading a cached blob is **2–4× faster** than
+re-compiling from IR, reducing cold-start latency from ~2.6 s to well
+under 1 s on typical Intel hardware.
+
+If a cached blob is corrupted or incompatible, the system automatically
+falls back to full compilation without crashing. The cache can be cleared
+by deleting `~/.deepsearch/cache/`.
+
+### Daemon Mode (Extremely Fast CLI Startup)
+
+Loading heavy AI libraries (PyTorch, FAISS, Transformers) and large LLM models introduces an unavoidable 15-20 second "cold start" delay every time you run a CLI command. 
+
+To eliminate this entirely, you can run the system in **Daemon Mode**. The Daemon is a lightweight background server that keeps all models and indices resident in system memory. When the Daemon is running, the CLI instantly offloads computation to it via local HTTP requests.
+
+**1. Start the Daemon in the background:**
+```bash
+python3 src/daemon.py --path data/processed &
+```
+
+**2. Use the CLI normally:**
+```bash
+python3 cli.py search "What is the invoice total?"
+python3 cli.py ask "Summarize the latest document."
+```
+The CLI detects the running Daemon automatically and returns results in **~0.1 to 0.4 seconds** (a ~50x speedup).
+
+**3. Stop the Daemon:**
+```bash
+pkill -f "src.daemon"
+```
+
 ## OpenVINO Integration
 
 This project explicitly leverages OpenVINO for:
 
-1.  **Embeddings**: `sentence-transformers` models are exported to OpenVINO IR format for faster CPU inference.
+1.  **Embeddings**: `sentence-transformers` models exported to OpenVINO IR and optionally cached as compiled blobs for instant warm starts.
 2.  **LLM Inference**: Supports `optimum-intel` to run LLMs directly on Intel CPU/GPU/NPU without external servers.
 3.  **OCR**: PaddleOCR inference accelerated via OpenVINO ONNX backend (default engine; Tesseract fallback).
 4.  **CLIP Vision**: CLIP image encoder optionally compiled to OpenVINO IR for accelerated multimodal embeddings.

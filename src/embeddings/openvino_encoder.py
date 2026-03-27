@@ -46,6 +46,7 @@ Implementation notes:
            This is critical because FAISS uses IndexFlatIP (inner product).
 """
 
+import hashlib
 import logging
 import time
 from pathlib import Path
@@ -56,6 +57,21 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 EMBEDDING_DIM = 384
+
+# ---------------------------------------------------------------------------
+# Compiled-model cache
+# ---------------------------------------------------------------------------
+# Cache compiled OpenVINO blobs to ~/.deepsearch/cache so that subsequent
+# runs skip the read_model + compile_model step entirely.
+# The cache key encodes model path + device so blobs are never reused
+# across devices or after the model file changes (path changes).
+
+_CACHE_DIR = Path.home() / ".deepsearch" / "cache"
+
+
+def _get_cache_key(model_path: str, device: str) -> str:
+    """Return an MD5 hex digest that uniquely identifies a (model, device) pair."""
+    return hashlib.md5(f"{model_path}_{device}".encode()).hexdigest()
 
 # Default tokenizer name (same model the IR was exported from)
 DEFAULT_TOKENIZER = "sentence-transformers/all-MiniLM-L6-v2"
@@ -157,10 +173,51 @@ class OVEmbeddingEncoder:
                 return
 
             core = Core()
-            model = core.read_model(model=str(xml_path))
-            self._compiled_model = core.compile_model(
-                model=model, device_name=device
-            )
+
+            # ----------------------------------------------------------
+            # Compiled-model cache (warm start)
+            # ----------------------------------------------------------
+            _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            cache_key  = _get_cache_key(str(xml_path), device)
+            cache_path = _CACHE_DIR / f"{cache_key}.blob"
+
+            cache_loaded = False
+            if cache_path.exists():
+                try:
+                    print("[OVEncoder] Loading compiled model from cache...")
+                    with open(cache_path, "rb") as _f:
+                        model_bytes = _f.read()
+                    self._compiled_model = core.import_model(model_bytes, device)
+                    cache_loaded = True
+                except Exception as _cache_exc:
+                    # Corrupted / incompatible blob — fall through to recompile.
+                    logger.warning(
+                        "Cache load failed (%s), recompiling model.", _cache_exc
+                    )
+                    cache_loaded = False
+
+            if not cache_loaded:
+                print("[OVEncoder] Compiling model (first run — this may take a moment)...")
+                model = core.read_model(model=str(xml_path))
+                self._compiled_model = core.compile_model(
+                    model=model, device_name=device
+                )
+                # Persist the compiled blob for future runs.
+                try:
+                    import io
+                    user_stream = io.BytesIO()
+                    self._compiled_model.export_model(user_stream)
+                    with open(cache_path, "wb") as _f:
+                        _f.write(user_stream.getvalue())
+                    print(
+                        f"[OVEncoder] Compiled model cached at {cache_path}"
+                    )
+                except Exception as _export_exc:
+                    logger.warning(
+                        "Could not cache compiled model (%s) — "
+                        "compilation will repeat on next run.",
+                        _export_exc,
+                    )
 
             # Discover input/output tensor names
             self._input_names = [

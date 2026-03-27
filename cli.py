@@ -498,12 +498,42 @@ def cmd_search(args: argparse.Namespace) -> None:
     Semantic search: encode query -> search FAISS index -> display results.
     No LLM involved -- pure embedding-based retrieval.
     """
+    query = args.query
+    top_k = args.top_k
+
+    # ---------------------------------------------------------
+    # Attempt Daemon Mode (Instant Execution)
+    # ---------------------------------------------------------
+    import urllib.request
+    import json
+    try:
+        global SETTINGS
+        port = SETTINGS.get("daemon", {}).get("port", 8500)
+        req_data = json.dumps({"query": query, "top_k": top_k}).encode("utf-8")
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/search", data=req_data, headers={'Content-Type': 'application/json'})
+        with urllib.request.urlopen(req, timeout=10.0) as response:
+            if response.status == 200:
+                resp_data = json.loads(response.read().decode('utf-8'))
+                _header(f"Search (Daemon)  {SYM_ARROW}  \"{_C.WHITE}{query}{_C.RESET}{_C.BOLD}{_C.CYAN}\"")
+                
+                results = resp_data.get("results", [])
+                if not results:
+                    _warn("No results found.")
+                else:
+                    for i, r in enumerate(results, start=1):
+                        score_str = f"[{r.get('score', 0):.4f}]"
+                        doc_str = r.get("doc_id", "unknown")
+                        snip = r.get("content", "").replace("\n", " ").strip()[:150]
+                        print(f"  {_C.MAGENTA}{i}.{_C.RESET} {score_str} {doc_str} : {snip}...")
+                print(f"  {_C.GREEN}{_C.BOLD}{SYM_CHECK} Done{_C.RESET}\n")
+                return
+    except Exception:
+        # Daemon Unreachable -> Fall back cleanly to Local Execution (no logging to avoid clutter)
+        pass
+
     from src.embeddings.encoder import EmbeddingEncoder
     from src.index.faiss_index import FaissIndex
     from src.retrieval.retriever import Retriever
-
-    query = args.query
-    top_k = args.top_k
 
     _header(f"Search  {SYM_ARROW}  \"{_C.WHITE}{query}{_C.RESET}{_C.BOLD}{_C.CYAN}\"")
 
@@ -1259,14 +1289,16 @@ def cmd_benchmark(args: argparse.Namespace) -> None:
     """
     run_embeddings = getattr(args, "embeddings", False)
     run_llm = getattr(args, "llm", False)
+    run_startup = getattr(args, "startup", False)
     run_all = getattr(args, "all", False)
 
-    if not run_embeddings and not run_llm:
+    if not run_embeddings and not run_llm and not run_startup:
         run_all = True
 
     if run_all:
         run_embeddings = True
         run_llm = True
+        run_startup = True
 
     batch_size = getattr(args, "batch_size", 16)
     iterations = getattr(args, "iterations", 20)
@@ -1325,7 +1357,7 @@ def cmd_benchmark(args: argparse.Namespace) -> None:
     # ---- LLM benchmark ----
     if run_llm:
         _step(2 if run_embeddings else 1,
-              2 if run_embeddings and run_llm else 1,
+              3 if run_startup else 2,
               "Running LLM benchmark")
 
         from src.benchmark.llm_benchmark import (
@@ -1344,6 +1376,18 @@ def cmd_benchmark(args: argparse.Namespace) -> None:
             prefer_openvino=prefer_ov,
         )
         print_llm_results(llm_results)
+
+    # ---- CLI Startup benchmark ----
+    if run_startup:
+        _step(3 if run_embeddings and run_llm else 2,
+              3 if run_embeddings and run_llm else 2,
+              "Running Startup benchmark (End-to-End)")
+        from src.benchmark.startup_benchmark import (
+            benchmark_startup,
+            print_startup_results
+        )
+        startup_results = benchmark_startup(n_warm_runs=3)
+        print_startup_results(startup_results)
 
     print(f"  {_C.GREEN}{_C.BOLD}{SYM_CHECK} Benchmark complete{_C.RESET}\n")
 
@@ -2007,6 +2051,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--llm",
         action="store_true",
         help="Benchmark LLM inference (OpenVINO or Ollama)",
+    )
+    p_bench.add_argument(
+        "--startup",
+        action="store_true",
+        help="Benchmark End-to-End CLI Startup (warm vs cold cache)",
     )
     p_bench.add_argument(
         "--all",

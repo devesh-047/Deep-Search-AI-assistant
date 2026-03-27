@@ -34,14 +34,6 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# Guard the sentence-transformers import
-try:
-    from sentence_transformers import SentenceTransformer
-
-    ST_AVAILABLE = True
-except ImportError:
-    ST_AVAILABLE = False
-
 # ---------------------------------------------------------------------------
 # Default model identifier -- override via configs/settings.yaml
 # ---------------------------------------------------------------------------
@@ -71,7 +63,9 @@ class EmbeddingEncoder:
             device     : "cpu" or "cuda" (cpu recommended for stability)
             cache_dir  : where to cache downloaded model weights
         """
-        if not ST_AVAILABLE:
+        try:
+            from sentence_transformers import SentenceTransformer
+        except ImportError:
             raise ImportError(
                 "sentence-transformers is required. "
                 "Install: pip install sentence-transformers"

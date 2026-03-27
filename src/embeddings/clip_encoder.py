@@ -41,18 +41,9 @@ logger = logging.getLogger(__name__)
 CLIP_DIMENSION = 512
 DEFAULT_MODEL_NAME = "openai/clip-vit-base-patch32"
 
-# Guard imports
-try:
-    from transformers import CLIPModel, CLIPProcessor, CLIPTokenizerFast
-    CLIP_AVAILABLE = True
-except ImportError:
-    CLIP_AVAILABLE = False
-
-try:
-    from PIL import Image
-    PIL_AVAILABLE = True
-except ImportError:
-    PIL_AVAILABLE = False
+# ---------------------------------------------------------------------------
+# Lazy Imports: Defer loading transformers and PIL until CLIPEncoder is instantiated
+# ---------------------------------------------------------------------------
 
 
 class CLIPEncoder:
@@ -95,14 +86,18 @@ class CLIPEncoder:
         self._processor = None
         self._ov_vision_model = None
 
-        if not CLIP_AVAILABLE:
+        try:
+            from transformers import CLIPModel, CLIPProcessor
+        except ImportError:
             logger.warning(
                 "transformers CLIP classes not available. "
                 "Install: pip install transformers"
             )
             return
 
-        if not PIL_AVAILABLE:
+        try:
+            from PIL import Image
+        except ImportError:
             logger.warning(
                 "Pillow is required for image processing. "
                 "Install: pip install Pillow"
